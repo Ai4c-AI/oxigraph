@@ -2,6 +2,16 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>    
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- NuGet package metadata -->
+    <Version>0.5.7</Version>
+    <Authors>Oxigraph Contributors</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/oxigraph/oxigraph</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/oxigraph/oxigraph</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>RDF;SPARQL;Graph;Database;SemanticWeb</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 </Project>
