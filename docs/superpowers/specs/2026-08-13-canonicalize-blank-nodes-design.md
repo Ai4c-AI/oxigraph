@@ -1,60 +1,60 @@
-# Dotnet Canonicalize Blank Nodes — Feature Parity Design
+# Dotnet Canonicalize Blank Nodes — 功能对等设计
 
-**Date**: 2026-08-13
-**Status**: Draft
-**Parent commit**: `820c8ddca8b183d41fa1f4f2a99cf604ef1ba173`
-**Target commit**: `cb228e5f36fcfd3d6908621ba9be08d89d925ae1`
-**Python commit**: `061df0483503e39aee798a09eb8766804c9b4e8f`
+**日期**: 2026-08-13
+**状态**: 待用户审核
+**起始 commit**: `820c8ddca8b183d41fa1f4f2a99cf604ef1ba173`
+**目标 commit**: `cb228e5f36fcfd3d6908621ba9be08d89d925ae1`
+**对应 Python commit**: `061df0483503e39aee798a09eb8766804c9b4e8f`
 
-## Goal
+## 目标
 
-Implement feature parity for Python's `canonicalize_blank_nodes` functionality in Dotnet, keeping Rust FFI layer in sync.
+在 Dotnet 侧实现 Python `canonicalize_blank_nodes` 功能对等，同时保持 Rust FFI 层同步。
 
-## Scope
+## 范围
 
-### Files to modify
+### 需修改的文件
 
-| Layer | File | Change |
-|-------|------|--------|
-| Rust FFI | `dotnet/src/oxigraph-dotnet/src/ffi.rs` | Add `oxigraph_dataset_canonicalize_blank_nodes` |
-| C# enum | `dotnet/src/Oxigraph/RdfFormat.cs` | Add `UnstableHashedIds` to `CanonicalizationAlgorithm` |
-| C# method | `dotnet/src/Oxigraph/Dataset.cs` | Add `CanonicalizeBlankNodes()` |
-| C# tests | `dotnet/tests/Oxigraph.Tests/ModelTests.cs` | Add tests for new functionality |
+| 层级 | 文件 | 变更内容 |
+|------|------|---------|
+| Rust FFI | `dotnet/src/oxigraph-dotnet/src/ffi.rs` | 新增 `oxigraph_dataset_canonicalize_blank_nodes` |
+| C# 枚举 | `dotnet/src/Oxigraph/RdfFormat.cs` | `CanonicalizationAlgorithm` 新增 `UnstableHashedIds` |
+| C# 方法 | `dotnet/src/Oxigraph/Dataset.cs` | 新增 `CanonicalizeBlankNodes()` |
+| C# 测试 | `dotnet/tests/Oxigraph.Tests/ModelTests.cs` | 新增单元测试 |
 
-### Files not in scope
+### 不在范围内
 
-- Python binding (already implemented in commit 061df048)
-- Documentation updates (not requested)
+- Python binding（已在 commit 061df048 实现）
+- 文档更新（未要求）
 
-## Design
+## 设计
 
-### 1. Rust FFI Layer
+### 1. Rust FFI 层
 
-**New function**: `oxigraph_dataset_canonicalize_blank_nodes`
+**新函数**: `oxigraph_dataset_canonicalize_blank_nodes`
 
 ```rust
 pub extern "C" fn oxigraph_dataset_canonicalize_blank_nodes(
     handle: DatasetHandle,
     algorithm: *const c_char,
 ) -> *mut c_char {
-    // 1. Parse algorithm string to CanonicalizationAlgorithm
-    // 2. Call dataset.canonicalize_blank_nodes(algorithm)
-    // 3. Serialize HashMap<BlankNode, BlankNode> to JSON:
+    // 1. 解析 algorithm 字符串为 CanonicalizationAlgorithm
+    // 2. 调用 dataset.canonicalize_blank_nodes(algorithm)
+    // 3. 将 HashMap<BlankNode, BlankNode> 序列化为 JSON:
     //    {"ok": {"<original_id>": "<canonical_id>", ...}}
-    // 4. Return owned C string (caller must free)
+    // 4. 返回自有 C 字符串（由调用方释放）
 }
 ```
 
-**Algorithm string mapping**:
+**算法字符串映射**:
 
-| CanonicalizationAlgorithm | FFI string |
+| CanonicalizationAlgorithm | FFI 字符串 |
 |--------------------------|------------|
 | `Unstable` | `"unstable"` |
 | `UnstableHashedIds` | `"unstable_hashed_ids"` |
 | `Rdfc10 { Sha256 }` | `"rdfc10_sha256"` |
 | `Rdfc10 { Sha384 }` | `"rdfc10_sha384"` |
 
-**JSON response format**:
+**JSON 响应格式**:
 
 ```json
 {
@@ -65,48 +65,46 @@ pub extern "C" fn oxigraph_dataset_canonicalize_blank_nodes(
 }
 ```
 
-On error:
+错误时:
 ```json
 {
   "error": "error message"
 }
 ```
 
-### 2. C# CanonicalizationAlgorithm Enum
+### 2. C# CanonicalizationAlgorithm 枚举
 
-**File**: `dotnet/src/Oxigraph/RdfFormat.cs`
+**文件**: `dotnet/src/Oxigraph/RdfFormat.cs`
 
 ```csharp
 public enum CanonicalizationAlgorithm
 {
-    /// <summary>Oxigraph preferred algorithm (unstable).</summary>
+    /// <summary>Oxigraph 首选算法（不稳定）。</summary>
     Unstable,
-    /// <summary>RDFC-1.0 with SHA-256.</summary>
+    /// <summary>RDFC-1.0 with SHA-256。</summary>
     Rdfc10Sha256,
-    /// <summary>RDFC-1.0 with SHA-384.</summary>
+    /// <summary>RDFC-1.0 with SHA-384。</summary>
     Rdfc10Sha384,
-    /// <summary>Oxigraph preferred algorithm but outputting ids based on hashes.</summary>
+    /// <summary>Oxigraph 首选算法，但输出的 ID 基于哈希值。</summary>
     /// <remarks>
-    /// This enables the use of blank node ids for diffing where additions or deletions
-    /// of triples affect fewer blank node ids. Warning: might change between Oxigraph
-    /// versions. No stability guarantees.
+    /// 这使得空白节点 ID 可用于 diff 场景，添加或删除 triple 时影响的空白节点 ID 更少。
+    /// 警告：可能在 Oxigraph 版本间发生变化，不保证稳定性。
     /// </remarks>
     UnstableHashedIds,
 }
 ```
 
-### 3. C# Dataset Method
+### 3. C# Dataset 方法
 
-**File**: `dotnet/src/Oxigraph/Dataset.cs`
+**文件**: `dotnet/src/Oxigraph/Dataset.cs`
 
 ```csharp
 /// <summary>
-/// Returns a map between the current dataset blank nodes and the canonicalized blank nodes
-/// to create a canonical dataset.
+/// 返回当前数据集中空白节点到规范化空白节点的映射，用于创建规范化数据集。
 ///
-/// See <see cref="Canonicalize"/> for more details.
+/// 详见 <see cref="Canonicalize"/>。
 ///
-/// :param algorithm: the canonicalization algorithm to use.
+/// :param algorithm: 要使用的规范化算法。
 /// :rtype: IReadOnlyDictionary{BlankNode, BlankNode}
 ///
 /// </summary>
@@ -136,26 +134,31 @@ public IReadOnlyDictionary<BlankNode, BlankNode> CanonicalizeBlankNodes(
 }
 ```
 
-**Decision: no async variant** — aligns with user's explicit choice.
+**决策：无异步变体** — 与用户明确选择一致。
 
-### 4. NativeMethods Entry Point
+### 4. NativeMethods 入口点
 
-**File**: `dotnet/src/Oxigraph/Interop/NativeMethods.g.cs`
+**文件**: `dotnet/src/oxigraph-dotnet/src/ffi.rs`
 
-```csharp
-[LibraryImport(LibName, EntryPoint = "oxigraph_dataset_canonicalize_blank_nodes", StringMarshalling = StringMarshalling.Utf8)]
-internal static partial IntPtr dataset_canonicalize_blank_nodes(IntPtr handle, string algorithm);
+```rust
+[no_mangle]
+pub extern "C" fn oxigraph_dataset_canonicalize_blank_nodes(
+    handle: DatasetHandle,
+    algorithm: *const c_char,
+) -> *mut c_char {
+    // 实现逻辑
+}
 ```
 
-Note: `NativeMethods.g.cs` is auto-generated by P/Invoke source generator from `ffi.rs`. The implementation lives in `ffi.rs`; no manual changes to `.g.cs` are needed.
+注意：`NativeMethods.g.cs` 是由 P/Invoke Source Generator 从 `ffi.rs` 自动生成的，无需手动修改 `.g.cs` 文件。
 
-### 5. Error Handling
+### 5. 错误处理
 
-- FFI layer returns error JSON on failure
-- `FFIHelper.ThrowIfError(response)` throws `OxigraphException` on error
-- `KeyNotFoundException` not used — this method returns a mapping, never a "not found" condition
+- FFI 层失败时返回错误 JSON
+- `FFIHelper.ThrowIfError(response)` 在出错时抛出 `OxigraphException`
+- 不使用 `KeyNotFoundException` — 此方法返回映射，不存在"未找到"的情况
 
-## Data Flow
+## 数据流
 
 ```
 C# Dataset.CanonicalizeBlankNodes()
@@ -164,20 +167,20 @@ C# Dataset.CanonicalizeBlankNodes()
   → oxrdf dataset.canonicalize_blank_nodes()
   → HashMap<BlankNode, BlankNode>
   → JSON {"ok": {"b0": "c14n0", ...}}
-  → C# deserializes to IReadOnlyDictionary<BlankNode, BlankNode>
+  → C# 反序列化为 IReadOnlyDictionary<BlankNode, BlankNode>
 ```
 
-## Testing
+## 测试
 
-### Unit tests (ModelTests.cs)
+### 单元测试（ModelTests.cs）
 
-1. **Basic roundtrip**: Create Dataset with BlankNode quads → call `CanonicalizeBlankNodes(UNSTABLE)` → verify returned mapping contains original and canonical IDs
-2. **RDFC-1.0**: Same test with `Rdfc10Sha256` algorithm
-3. **UnstableHashedIds**: Same test with `UnstableHashedIds` algorithm, verify IDs are stable across multiple calls
-4. **Empty dataset**: Verify empty dictionary returned
-5. **No blank nodes**: Verify empty dictionary when dataset has no blank nodes
+1. **基本往返**：创建含 BlankNode 的 Dataset → 调用 `CanonicalizeBlankNodes(UNSTABLE)` → 验证返回映射包含原始 ID 和规范 ID
+2. **RDFC-1.0**：使用 `Rdfc10Sha256` 算法
+3. **UnstableHashedIds**：使用 `UnstableHashedIds` 算法，验证多次调用 ID 稳定
+4. **空数据集**：验证返回空字典
+5. **无空白节点**：验证无空白节点时返回空字典
 
-### Test pattern (inspired by Python):
+### 测试示例
 
 ```csharp
 [Fact]
@@ -196,9 +199,9 @@ public void CanonicalizeBlankNodes_ReturnsCorrectMapping()
 }
 ```
 
-## Constraints
+## 约束
 
-- FFI call is **synchronous only** (no Task-based async)
-- Return type is **immutable** (`IReadOnlyDictionary`) to enforce read-only contract
-- Default algorithm is **Unstable** (matches Python default)
-- No changes to existing `Canonicalize()` method — new method is additive only
+- FFI 调用**仅同步**（无 Task-based 异步）
+- 返回类型为**不可变**（`IReadOnlyDictionary`）以强制只读契约
+- 默认算法为 **Unstable**（与 Python 默认值一致）
+- 不修改现有 `Canonicalize()` 方法 — 新方法为纯添加
