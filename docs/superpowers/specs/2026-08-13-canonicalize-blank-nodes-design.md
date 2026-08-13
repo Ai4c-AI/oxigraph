@@ -20,11 +20,16 @@
 | C# 枚举 | `dotnet/src/Oxigraph/RdfFormat.cs` | `CanonicalizationAlgorithm` 新增 `UnstableHashedIds` |
 | C# 方法 | `dotnet/src/Oxigraph/Dataset.cs` | 新增 `CanonicalizeBlankNodes()` |
 | C# 测试 | `dotnet/tests/Oxigraph.Tests/ModelTests.cs` | 新增单元测试 |
+| 文档 | `dotnet/docs/model.md` | 补充 `CanonicalizeBlankNodes` 和 `UnstableHashedIds` 说明 |
+
+### 参考
+
+- Python binding（`python/src/dataset.rs`）— Dotnet binding 实现参考
+- Python commit: `061df0483503e39aee798a09eb8766804c9b4e8f`
 
 ### 不在范围内
 
-- Python binding（已在 commit 061df048 实现）
-- 文档更新（未要求）
+- Python binding 本身（已在 commit 061df048 实现）
 
 ## 设计
 
