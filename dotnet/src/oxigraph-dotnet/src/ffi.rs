@@ -2256,6 +2256,33 @@ pub extern "C" fn oxigraph_dataset_canonicalize(handle: DatasetHandle, algorithm
     ok_json(&"canonicalized")
 }
 
+/// Returns a map between the current dataset blank nodes and the canonicalized blank nodes.
+#[unsafe(no_mangle)]
+pub extern "C" fn oxigraph_dataset_canonicalize_blank_nodes(handle: DatasetHandle, algorithm: *const c_char) -> *mut c_char {
+    if handle.is_null() {
+        return error_json(ErrorKind::InvalidArgument { message: "Dataset handle is null".into() });
+    }
+    let dataset = unsafe { &mut *(*handle).get() };
+    let algo_str = unsafe { c_str_to_str(algorithm) };
+    let algo = match algo_str {
+        "unstable" => oxigraph::model::dataset::CanonicalizationAlgorithm::Unstable,
+        "unstable_hashed_ids" => oxigraph::model::dataset::CanonicalizationAlgorithm::UnstableHashedIds,
+        "rdfc10_sha256" => oxigraph::model::dataset::CanonicalizationAlgorithm::Rdfc10 {
+            hash_algorithm: oxigraph::model::dataset::CanonicalizationHashAlgorithm::Sha256,
+        },
+        "rdfc10_sha384" => oxigraph::model::dataset::CanonicalizationAlgorithm::Rdfc10 {
+            hash_algorithm: oxigraph::model::dataset::CanonicalizationHashAlgorithm::Sha384,
+        },
+        _ => return error_json(ErrorKind::InvalidArgument { message: format!("Unknown canonicalization algorithm: {algo_str}") }),
+    };
+    let mapping = dataset.canonicalize_blank_nodes(algo);
+    let map: Map<String, Value> = mapping
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+        .collect();
+    ok_json(&Value::Object(map))
+}
+
 /// Destroy a Dataset and free memory.
 #[unsafe(no_mangle)]
 pub extern "C" fn oxigraph_dataset_destroy(handle: DatasetHandle) {
