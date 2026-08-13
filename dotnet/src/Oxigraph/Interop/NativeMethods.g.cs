@@ -206,6 +206,9 @@ internal static partial class OxigraphNative
     [LibraryImport(LibName, EntryPoint = "oxigraph_dataset_canonicalize", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial IntPtr dataset_canonicalize(IntPtr handle, string algorithm);
 
+    [LibraryImport(LibName, EntryPoint = "oxigraph_dataset_canonicalize_blank_nodes", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr dataset_canonicalize_blank_nodes(IntPtr handle, string algorithm);
+
     [LibraryImport(LibName, EntryPoint = "oxigraph_dataset_destroy")]
     internal static partial void dataset_destroy(IntPtr handle);
 

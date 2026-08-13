@@ -174,12 +174,46 @@ public sealed class Dataset : IEnumerable<Quad>, IDisposable
         var algoStr = algorithm switch
         {
             CanonicalizationAlgorithm.Unstable => "unstable",
+            CanonicalizationAlgorithm.UnstableHashedIds => "unstable_hashed_ids",
             CanonicalizationAlgorithm.Rdfc10Sha256 => "rdfc10_sha256",
             CanonicalizationAlgorithm.Rdfc10Sha384 => "rdfc10_sha384",
             _ => "unstable",
         };
         FFIHelper.CallVoid(() =>
             OxigraphNative.dataset_canonicalize(_handle.DangerousGetHandle(), algoStr));
+    }
+
+    /// <summary>
+    /// Returns a map between the current dataset blank nodes and the canonicalized blank nodes
+    /// to create a canonical dataset.
+    ///
+    /// See <see cref="Canonicalize"/> for more details.
+    /// </summary>
+    /// <param name="algorithm">The canonicalization algorithm to use.</param>
+    /// <returns>A mapping from original blank nodes to canonicalized blank nodes.</returns>
+    public IReadOnlyDictionary<BlankNode, BlankNode> CanonicalizeBlankNodes(
+        CanonicalizationAlgorithm algorithm = CanonicalizationAlgorithm.Unstable)
+    {
+        var algoStr = algorithm switch
+        {
+            CanonicalizationAlgorithm.Unstable => "unstable",
+            CanonicalizationAlgorithm.UnstableHashedIds => "unstable_hashed_ids",
+            CanonicalizationAlgorithm.Rdfc10Sha256 => "rdfc10_sha256",
+            CanonicalizationAlgorithm.Rdfc10Sha384 => "rdfc10_sha384",
+            _ => "unstable",
+        };
+        var jsonPtr = OxigraphNative.dataset_canonicalize_blank_nodes(_handle.DangerousGetHandle(), algoStr);
+        var response = ReadAndFree(jsonPtr);
+        FFIHelper.ThrowIfError(response);
+
+        using var doc = JsonDocument.Parse(response);
+        var ok = doc.RootElement.GetProperty("ok");
+        var dict = new Dictionary<BlankNode, BlankNode>();
+        foreach (var prop in ok.EnumerateObject())
+        {
+            dict[new BlankNode(prop.Name)] = new BlankNode(prop.Value.GetString()!);
+        }
+        return dict;
     }
 
     // ─── Serialization ────────────────────
