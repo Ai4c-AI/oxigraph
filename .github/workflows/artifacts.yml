@@ -515,7 +515,6 @@ jobs:
           find runtimes -type f | while IFS= read -r filepath; do
             if echo "$filepath" | grep -q '\\'; then
               echo "Found Windows-style path: $filepath"
-              # Convert backslashes to forward slashes
               normalized=$(echo "$filepath" | tr '\\' '/')
               dir=$(dirname "$normalized")
               mkdir -p "$dir"
@@ -533,30 +532,28 @@ jobs:
             fi
           done
 
-          # Handle flat files (merge-multiple strips platform subdirs, placing files directly in runtimes/)
-          # Detect platform from filename: .so=linux, .dylib=osx, .dll=windows
-          for f in runtimes/*; do
+          # Handle files inside runtimes/native/ (merge-multiple puts them here when artifact path
+          # was runtimes/<os>-<arch>/native/<file>). Also handles flat files in runtimes/ directly.
+          # Detect platform from extension: .so=linux, .dylib=osx, .dll=windows
+          find runtimes -type f | while IFS= read -r f; do
             filename=$(basename "$f")
-            if [ -f "$f" ]; then
-              case "$filename" in
-                *.dll)
-                  echo "Detected Windows DLL: $filename -> win-x64/native/"
-                  mkdir -p runtimes/win-x64/native
-                  mv "$f" runtimes/win-x64/native/
-                  ;;
-                *.dylib)
-                  # macOS dylib - could be x64 or arm64, default to x64 for the generic dylib
-                  echo "Detected macOS dylib: $filename -> osx-x64/native/"
-                  mkdir -p runtimes/osx-x64/native
-                  mv "$f" runtimes/osx-x64/native/
-                  ;;
-                *.so)
-                  echo "Detected Linux SO: $filename -> linux-x64/native/"
-                  mkdir -p runtimes/linux-x64/native
-                  mv "$f" runtimes/linux-x64/native/
-                  ;;
-              esac
-            fi
+            case "$filename" in
+              *.dll)
+                echo "Detected Windows DLL: $filename -> win-x64/native/"
+                mkdir -p runtimes/win-x64/native
+                mv "$f" runtimes/win-x64/native/
+                ;;
+              *.dylib)
+                echo "Detected macOS dylib: $filename -> osx-x64/native/"
+                mkdir -p runtimes/osx-x64/native
+                mv "$f" runtimes/osx-x64/native/
+                ;;
+              *.so)
+                echo "Detected Linux SO: $filename -> linux-x64/native/"
+                mkdir -p runtimes/linux-x64/native
+                mv "$f" runtimes/linux-x64/native/
+                ;;
+            esac
           done
 
           echo "=== Final structure ==="
