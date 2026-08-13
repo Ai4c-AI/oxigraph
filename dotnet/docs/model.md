@@ -283,6 +283,7 @@ public sealed class Dataset : IEnumerable<Quad>, IDisposable
 | `QuadsForObject(ITerm)` | Shorthand for `Match(@object: ...)` |
 | `QuadsForGraphName(IGraphName)` | Shorthand for `Match(graph: ...)` |
 | `Canonicalize(CanonicalizationAlgorithm)` | Canonicalize blank nodes in-place |
+| `CanonicalizeBlankNodes(CanonicalizationAlgorithm)` → `IReadOnlyDictionary<BlankNode, BlankNode>` | Returns a mapping from original blank nodes to canonicalized blank nodes |
 | `Load(string, RdfFormat, LoadOptions?)` | Parse RDF text into the dataset |
 | `Dump(RdfFormat, DumpOptions?)` → `string` | Serialize dataset to RDF text |
 | `LoadAsync(string, RdfFormat, LoadOptions?, CancellationToken)` → `Task` | Async parse RDF text into the dataset |
@@ -293,9 +294,10 @@ public sealed class Dataset : IEnumerable<Quad>, IDisposable
 ```csharp
 public enum CanonicalizationAlgorithm
 {
-    Unstable,        // PyOxigraph preferred algorithm
-    Rdfc10Sha256,    // RDFC-1.0 with SHA-256
-    Rdfc10Sha384,    // RDFC-1.0 with SHA-384
+    Unstable,             // Oxigraph preferred algorithm (unstable)
+    UnstableHashedIds,    // Oxigraph preferred algorithm with hash-based IDs (unstable)
+    Rdfc10Sha256,         // RDFC-1.0 with SHA-256
+    Rdfc10Sha384,         // RDFC-1.0 with SHA-384
 }
 ```
 
@@ -304,6 +306,12 @@ using var ds1 = new Dataset();
 ds1.Add(new Quad(new BlankNode(), new NamedNode("http://example.com/p"), new BlankNode(), new DefaultGraph()));
 ds1.Canonicalize(CanonicalizationAlgorithm.Rdfc10Sha256);
 Console.WriteLine(ds1);
+
+// CanonicalizeBlankNodes — returns a mapping from original to canonical blank node IDs
+using var ds2 = new Dataset();
+ds2.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+var mapping = ds2.CanonicalizeBlankNodes(CanonicalizationAlgorithm.Unstable);
+Console.WriteLine(mapping[new BlankNode("a")]);  // e.g. BlankNode { Value = "c14n0" }
 ```
 
 ---
