@@ -14,7 +14,40 @@
 | 层级 | 文件 | 变更内容 |
 |------|------|---------|
 | C# 方法 | `dotnet/src/Oxigraph/Dataset.cs` | 新增 `CanonicalizeBlankNodesAsync` |
+| C# 测试 | `dotnet/tests/Oxigraph.Tests/ModelTests.cs` | 新增异步版本测试 |
 | 文档 | `dotnet/docs/model.md` | 补充 `CanonicalizeBlankNodesAsync` 说明 |
+
+## 测试
+
+### 单元测试（ModelTests.cs）
+
+在现有 `CanonicalizeBlankNodes` 测试附近添加异步版本：
+
+```csharp
+[Fact]
+public async Task CanonicalizeBlankNodesAsync_ReturnsCorrectMapping()
+{
+    using var ds = new Dataset();
+    ds.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+
+    var mapping = await ds.CanonicalizeBlankNodesAsync(CanonicalizationAlgorithm.Unstable);
+
+    Assert.Single(mapping);
+    Assert.Contains(new BlankNode("a"), mapping.Keys);
+}
+
+[Fact]
+public async Task CanonicalizeBlankNodesAsync_CancellationToken_Cancels()
+{
+    using var ds = new Dataset();
+    ds.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+    using var cts = new CancellationTokenSource();
+    cts.Cancel();
+
+    await Assert.ThrowsAsync<TaskCanceledException>(
+        () => ds.CanonicalizeBlankNodesAsync(CanonicalizationAlgorithm.Unstable, cts.Token));
+}
+```
 
 ## 设计
 
