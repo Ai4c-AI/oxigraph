@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
 
     <!-- NuGet package metadata -->
-    <Version>0.5.7</Version>
+    <Version>0.6.0-dev</Version>
     <Authors>Oxigraph Contributors</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/oxigraph/oxigraph</PackageProjectUrl>
