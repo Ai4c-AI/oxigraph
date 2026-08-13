@@ -501,16 +501,34 @@ jobs:
           pattern: oxigraph_dotnet_*
           path: dotnet/src/Oxigraph/runtimes
           merge-multiple: true
-          extract: true
+      - name: Debug artifact structure
+        run: |
+          echo "=== Downloaded runtime structure ==="
+          find runtimes -type f 2>/dev/null || echo "No files found"
+          echo "=== Directory structure ==="
+          find runtimes -type d 2>/dev/null || echo "No dirs found"
+        working-directory: dotnet/src/Oxigraph
       - name: Flatten runtime artifacts
         run: |
-          # Move contents from nested runtimes/*/native/* to runtimes/*/native/*
+          # Handle both nested runtimes/runtimes/* and flat runtimes/* structures
+          # The merge-multiple can create either depending on artifact naming
           for arch_dir in runtimes/*/; do
+            arch_name=$(basename "$arch_dir")
+            # Case 1: Nested runtimes/runtimes/<os>-<arch>/native/* (from artifact internal paths)
             if [ -d "$arch_dir/runtimes" ]; then
+              echo "Found nested runtimes in $arch_name, flattening..."
               cp -r "$arch_dir/runtimes/"* "$arch_dir/" 2>/dev/null || true
               rm -rf "$arch_dir/runtimes"
             fi
+            # Case 2: Files directly in runtimes/<os>-<arch>/ (flat structure)
+            if [ -f "runtimes/$arch_name" ]; then
+              echo "Found flat file in $arch_name, moving to native/..."
+              mkdir -p "$arch_dir/native"
+              mv "runtimes/$arch_name" "$arch_dir/native/" 2>/dev/null || true
+            fi
           done
+          echo "=== Final structure ==="
+          find runtimes -type f 2>/dev/null
         working-directory: dotnet/src/Oxigraph
       - name: Extract version
         id: version
