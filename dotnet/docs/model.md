@@ -284,6 +284,7 @@ public sealed class Dataset : IEnumerable<Quad>, IDisposable
 | `QuadsForGraphName(IGraphName)` | Shorthand for `Match(graph: ...)` |
 | `Canonicalize(CanonicalizationAlgorithm)` | Canonicalize blank nodes in-place |
 | `CanonicalizeBlankNodes(CanonicalizationAlgorithm)` → `IReadOnlyDictionary<BlankNode, BlankNode>` | Returns a mapping from original blank nodes to canonicalized blank nodes |
+| `CanonicalizeBlankNodesAsync(CanonicalizationAlgorithm, CancellationToken)` → `Task<IReadOnlyDictionary<BlankNode, BlankNode>>` | Async version of CanonicalizeBlankNodes |
 | `Load(string, RdfFormat, LoadOptions?)` | Parse RDF text into the dataset |
 | `Dump(RdfFormat, DumpOptions?)` → `string` | Serialize dataset to RDF text |
 | `LoadAsync(string, RdfFormat, LoadOptions?, CancellationToken)` → `Task` | Async parse RDF text into the dataset |
