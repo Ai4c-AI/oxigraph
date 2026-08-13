@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Oxigraph</RootNamespace>
+    <AssemblyName>Oxigraph</AssemblyName>
+
+    <!-- NuGet package metadata -->
+    <PackageId>Oxigraph</PackageId>
+    <Description>Oxigraph RDF graph database with SPARQL support for .NET. Provides a high-performance, Rust-powered RDF store accessible from C# via FFI.</Description>
+  </PropertyGroup>
+
+  <!-- Multi-platform native libraries for NuGet packaging.
+       These are conditionally included during dotnet pack in CI
+       after native libs are downloaded into the runtimes/ directory. -->
+  <ItemGroup>
+    <None Include="..\..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="runtimes\win-x64\native\oxigraph_dotnet.dll"
+             Condition="Exists('runtimes\win-x64\native\oxigraph_dotnet.dll')"
+             PackagePath="runtimes\win-x64\native\oxigraph_dotnet.dll" />
+    <Content Include="runtimes\linux-x64\native\liboxigraph_dotnet.so"
+             Condition="Exists('runtimes\linux-x64\native\liboxigraph_dotnet.so')"
+             PackagePath="runtimes\linux-x64\native\liboxigraph_dotnet.so" />
+    <Content Include="runtimes\linux-arm64\native\liboxigraph_dotnet.so"
+             Condition="Exists('runtimes\linux-arm64\native\liboxigraph_dotnet.so')"
+             PackagePath="runtimes\linux-arm64\native\liboxigraph_dotnet.so" />
+    <Content Include="runtimes\osx-x64\native\liboxigraph_dotnet.dylib"
+             Condition="Exists('runtimes\osx-x64\native\liboxigraph_dotnet.dylib')"
+             PackagePath="runtimes\osx-x64\native\liboxigraph_dotnet.dylib" />
+    <Content Include="runtimes\osx-arm64\native\liboxigraph_dotnet.dylib"
+             Condition="Exists('runtimes\osx-arm64\native\liboxigraph_dotnet.dylib')"
+             PackagePath="runtimes\osx-arm64\native\liboxigraph_dotnet.dylib" />
+  </ItemGroup>
+
+</Project>

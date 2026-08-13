@@ -1710,6 +1710,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxigraph-dotnet"
+version = "0.1.0"
+dependencies = [
+ "oxigraph",
+ "oxrdf",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oxigraph-js"
 version = "0.6.0-dev"
 dependencies = [

@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Oxigraph.Extensions.DotNetRDF/Oxigraph.Extensions.DotNetRDF.csproj" />
+    <Project Path="src/Oxigraph/Oxigraph.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Oxigraph.Tests/Oxigraph.Tests.csproj" />
+  </Folder>
+</Solution>

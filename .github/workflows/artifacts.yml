@@ -8,6 +8,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      nuget-only:
+        description: '仅发布 NuGet 包（跳过 Python、npm、Docker、crates 等其他资产）'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,6 +23,7 @@ permissions: {}
 
 jobs:
   python_sdist:
+    if: inputs.nuget-only != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,6 +55,7 @@ jobs:
       - run: uvx twine check target/wheels/*
 
   wheel_linux:
+    if: inputs.nuget-only != true
     strategy:
       matrix:
         include:
@@ -93,6 +101,7 @@ jobs:
       - run: uvx twine check target/wheels/*
 
   wheel_linux_musl:
+    if: inputs.nuget-only != true
     strategy:
       matrix:
         include:
@@ -121,6 +130,7 @@ jobs:
       - run: uvx twine check target/wheels/*
 
   wheel_mac:
+    if: inputs.nuget-only != true
     strategy:
       matrix:
         include:
@@ -179,6 +189,7 @@ jobs:
       - run: uvx twine check target/wheels/*
 
   wheel_windows:
+    if: inputs.nuget-only != true
     strategy:
       matrix:
         include:
@@ -245,7 +256,7 @@ jobs:
       - run: uvx twine check target/wheels/*
 
   publish_pyoxigraph_pypi:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && inputs.nuget-only != true
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -270,7 +281,7 @@ jobs:
           skip-existing: true
 
   publish_oxigraph_pypi:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && inputs.nuget-only != true
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -296,7 +307,7 @@ jobs:
 
   npm_tarball:
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    if: (github.event_name == 'release' || github.ref == 'refs/heads/main') && inputs.nuget-only != true
     permissions:
       id-token: write
     steps:
@@ -326,7 +337,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    if: (github.event_name == 'release' || github.ref == 'refs/heads/main') && inputs.nuget-only != true
     permissions:
       id-token: write
       packages: write
@@ -383,8 +394,127 @@ jobs:
           push-to-registry: true
         if: github.event_name == 'release'
 
+  dotnet_native_linux:
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    continue-on-error: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+        with:
+          dotnet-version: '10.0.x'
+      - run: cargo build --release -p oxigraph-dotnet --features oxigraph/rocksdb
+      - run: mkdir -p runtimes/linux-${{ matrix.arch }}/native
+      - run: cp target/release/liboxigraph_dotnet.so runtimes/linux-${{ matrix.arch }}/native/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oxigraph_dotnet_linux_${{ matrix.arch }}
+          path: runtimes/linux-${{ matrix.arch }}/native/liboxigraph_dotnet.so
+
+  dotnet_native_macos:
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-apple-darwin
+          - arch: arm64
+            target: aarch64-apple-darwin
+    continue-on-error: true
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ matrix.target }}
+      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+        with:
+          dotnet-version: '10.0.x'
+      - run: cargo build --release -p oxigraph-dotnet --target ${{ matrix.target }} --features oxigraph/rocksdb
+      - run: mkdir -p runtimes/osx-${{ matrix.arch }}/native
+      - run: cp target/${{ matrix.target }}/release/liboxigraph_dotnet.dylib runtimes/osx-${{ matrix.arch }}/native/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oxigraph_dotnet_osx_${{ matrix.arch }}
+          path: runtimes/osx-${{ matrix.arch }}/native/liboxigraph_dotnet.dylib
+
+  dotnet_native_windows:
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+    continue-on-error: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+        with:
+          dotnet-version: '10.0.x'
+      - run: cargo build --release -p oxigraph-dotnet
+      - run: mkdir -p runtimes/win-${{ matrix.arch }}/native
+      - run: copy target\release\oxigraph_dotnet.dll runtimes\win-${{ matrix.arch }}\native\
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oxigraph_dotnet_win_${{ matrix.arch }}
+          path: runtimes\win-${{ matrix.arch }}\native\oxigraph_dotnet.dll
+
+  dotnet_pack:
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - dotnet_native_linux
+      - dotnet_native_macos
+      - dotnet_native_windows
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: oxigraph_dotnet_*
+          path: dotnet/src/Oxigraph/runtimes
+          merge-multiple: true
+      - name: Extract version
+        id: version
+        run: echo "VERSION=$(grep -m1 '^version' dotnet/src/oxigraph-dotnet/Cargo.toml | sed 's/.*\"\(.*\)\"/\1/')" >> $GITHUB_OUTPUT
+      - run: dotnet build dotnet/src/Oxigraph/ -c Release -p:Version=${{ steps.version.outputs.VERSION }}
+      - run: dotnet pack dotnet/src/Oxigraph/ -c Release --no-build -p:Version=${{ steps.version.outputs.VERSION }} -o dist
+      - run: dotnet build dotnet/src/Oxigraph.Extensions.DotNetRDF/ -c Release -p:Version=${{ steps.version.outputs.VERSION }}
+      - run: dotnet pack dotnet/src/Oxigraph.Extensions.DotNetRDF/ -c Release --no-build -p:Version=${{ steps.version.outputs.VERSION }} -o dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oxigraph_nuget
+          path: dist/*.nupkg
+      - run: gh release upload ${GITHUB_REF_NAME} dist/*.nupkg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: github.event_name == 'release'
+
   publish_crates:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && inputs.nuget-only != true
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -473,7 +603,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   full_archive:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && inputs.nuget-only != true
     runs-on: ubuntu-latest
     permissions:
       contents: write
