@@ -2,7 +2,7 @@
 use crate::ExpressionTriple;
 use crate::dataset::ExpressionTerm;
 use md5::{Digest, Md5};
-use oxiri::Iri;
+use oxiri::{Iri, IriRef};
 #[cfg(feature = "sparql-12")]
 use oxrdf::BaseDirection;
 use oxrdf::vocab::{rdf, xsd};
@@ -14,8 +14,8 @@ use rand::random;
 use regex::{Regex, RegexBuilder};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
-use spargebra::algebra::Function;
-use sparopt::algebra::{Expression, GraphPattern};
+use spargebra::vocab::sparql;
+use sparopt::algebra::{Expression, QueryExpression};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -44,34 +44,45 @@ pub trait ExpressionEvaluatorContext<'a> {
     ) -> impl Fn(&Self::Tuple) -> bool + 'a;
     fn build_exists(
         &mut self,
-        plan: &GraphPattern,
+        plan: &QueryExpression,
     ) -> Result<impl Fn(&Self::Tuple) -> bool + 'a, Self::Error>;
     fn internalize_named_node(&mut self, term: &NamedNode) -> Result<Self::Term, Self::Error>;
     fn internalize_literal(&mut self, term: &Literal) -> Result<Self::Term, Self::Error>;
     fn build_internalize_expression_term(
         &mut self,
-    ) -> impl Fn(ExpressionTerm) -> Option<Self::Term> + 'a; // TODO: return result
+    ) -> impl Fn(ExpressionTerm) -> Result<Self::Term, Self::Error> + 'a;
     fn build_externalize_expression_term(
         &mut self,
-    ) -> impl Fn(Self::Term) -> Option<ExpressionTerm> + 'a; // TODO: return result
+    ) -> impl Fn(Self::Term) -> Result<ExpressionTerm, Self::Error> + 'a;
+    fn build_externalize_term(&mut self) -> impl Fn(Self::Term) -> Result<Term, Self::Error> + 'a;
     fn now(&mut self) -> DateTime;
     fn base_iri(&mut self) -> Option<Iri<OxString>>;
     fn custom_functions(&mut self) -> &CustomFunctionRegistry;
 }
 
-pub type ExpressionEvaluator<'a, I, O> = Rc<dyn (Fn(&I) -> Option<O>) + 'a>;
+pub type ExpressionEvaluator<'a, I, O, E> = Rc<dyn (Fn(&I) -> Result<Option<O>, E>) + 'a>;
+
+macro_rules! try_or_ok {
+    ($value:expr) => {
+        if let Some(value) = $value {
+            value
+        } else {
+            return Ok(None);
+        }
+    };
+}
 
 #[derive(Debug, Error)]
 pub enum ExpressionEvaluationError<C> {
     /// Error from the evaluation context
     #[error(transparent)]
     Context(C),
-    /// The given custom function is not supported
-    #[error("The custom function {0} is not supported")]
-    UnsupportedCustomFunction(NamedNode),
-    /// The given custom function arity is not supported
-    #[error("The custom function {name} requires between {} and {} arguments, but {actual} were given", .expected.start(), .expected.end())]
-    UnsupportedCustomFunctionArity {
+    /// The given function is not supported
+    #[error("The function {0} is not supported")]
+    UnsupportedFunction(NamedNode),
+    /// The given function arity is not supported
+    #[error("The function {name} requires between {} and {} arguments, but {actual} were given", .expected.start(), .expected.end())]
+    UnsupportedFunctionArity {
         name: NamedNode,
         expected: RangeInclusive<usize>,
         actual: usize,
@@ -81,31 +92,36 @@ pub enum ExpressionEvaluationError<C> {
 pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
     expression: &Expression,
     context: &mut C,
-) -> Result<ExpressionEvaluator<'a, C::Tuple, ExpressionTerm>, ExpressionEvaluationError<C::Error>>
+) -> Result<
+    ExpressionEvaluator<'a, C::Tuple, ExpressionTerm, C::Error>,
+    ExpressionEvaluationError<C::Error>,
+>
+where
+    C::Error: 'a,
 {
     Ok(match expression {
         Expression::NamedNode(t) => {
             let t = ExpressionTerm::from(Term::from(t.clone()));
-            Rc::new(move |_| Some(t.clone()))
+            Rc::new(move |_| Ok(Some(t.clone())))
         }
         Expression::Literal(t) => {
             let t = ExpressionTerm::from(Term::from(t.clone()));
-            Rc::new(move |_| Some(t.clone()))
+            Rc::new(move |_| Ok(Some(t.clone())))
         }
         Expression::Variable(v) => {
             let lookup = context.build_variable_lookup(v);
             let externalize = context.build_externalize_expression_term();
-            Rc::new(move |t| externalize(lookup(t)?))
+            Rc::new(move |t| externalize(try_or_ok!(lookup(t))).map(Some))
         }
         Expression::Bound(v) => {
             let lookup = context.build_is_variable_bound(v);
-            Rc::new(move |tuple| Some(lookup(tuple).into()))
+            Rc::new(move |tuple| Ok(Some(lookup(tuple).into())))
         }
         Expression::Exists(plan) => {
             let exists = context
                 .build_exists(plan)
                 .map_err(ExpressionEvaluationError::Context)?;
-            Rc::new(move |tuple| Some(exists(tuple).into()))
+            Rc::new(move |tuple| Ok(Some(exists(tuple).into())))
         }
         Expression::Or(children) => {
             let children = children
@@ -115,13 +131,13 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
             Rc::new(move |tuple| {
                 let mut error = false;
                 for child in &children {
-                    match child(tuple).and_then(|e| e.effective_boolean_value()) {
-                        Some(true) => return Some(true.into()),
+                    match child(tuple)?.and_then(|e| e.effective_boolean_value()) {
+                        Some(true) => return Ok(Some(true.into())),
                         Some(false) => (),
                         None => error = true,
                     }
                 }
-                if error { None } else { Some(false.into()) }
+                Ok(if error { None } else { Some(false.into()) })
             })
         }
         Expression::And(children) => {
@@ -132,310 +148,14 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
             Rc::new(move |tuple| {
                 let mut error = false;
                 for child in &children {
-                    match child(tuple).and_then(|e| e.effective_boolean_value()) {
+                    match child(tuple)?.and_then(|e| e.effective_boolean_value()) {
                         Some(true) => (),
-                        Some(false) => return Some(false.into()),
+                        Some(false) => return Ok(Some(false.into())),
                         None => error = true,
                     }
                 }
-                if error { None } else { Some(true.into()) }
+                Ok(if error { None } else { Some(true.into()) })
             })
-        }
-        Expression::Equal(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| equals(&a(tuple)?, &b(tuple)?).map(Into::into))
-        }
-        Expression::SameTerm(a, b) => {
-            match (
-                try_build_internal_expression_evaluator(a, context)?,
-                try_build_internal_expression_evaluator(b, context)?,
-            ) {
-                (Some(a), Some(b)) => Rc::new(move |tuple| Some((a(tuple)? == b(tuple)?).into())),
-                (Some(a), None) => {
-                    let b = build_expression_evaluator(b, context)?;
-                    let internalize = context.build_internalize_expression_term();
-                    Rc::new(move |tuple| Some((a(tuple)? == internalize(b(tuple)?)?).into()))
-                }
-                (None, Some(b)) => {
-                    let a = build_expression_evaluator(a, context)?;
-                    let internalize = context.build_internalize_expression_term();
-                    Rc::new(move |tuple| Some((internalize(a(tuple)?)? == b(tuple)?).into()))
-                }
-                (None, None) => {
-                    let a = build_expression_evaluator(a, context)?;
-                    let b = build_expression_evaluator(b, context)?;
-                    Rc::new(move |tuple| Some((a(tuple)? == b(tuple)?).into()))
-                }
-            }
-        }
-        Expression::Greater(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some((partial_cmp(&a(tuple)?, &b(tuple)?)? == Ordering::Greater).into())
-            })
-        }
-        Expression::GreaterOrEqual(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some(
-                    match partial_cmp(&a(tuple)?, &b(tuple)?)? {
-                        Ordering::Greater | Ordering::Equal => true,
-                        Ordering::Less => false,
-                    }
-                    .into(),
-                )
-            })
-        }
-        Expression::Less(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some((partial_cmp(&a(tuple)?, &b(tuple)?)? == Ordering::Less).into())
-            })
-        }
-        Expression::LessOrEqual(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some(
-                    match partial_cmp(&a(tuple)?, &b(tuple)?)? {
-                        Ordering::Less | Ordering::Equal => true,
-                        Ordering::Greater => false,
-                    }
-                    .into(),
-                )
-            })
-        }
-        Expression::Add(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some(match NumericBinaryOperands::new(a(tuple)?, b(tuple)?)? {
-                    NumericBinaryOperands::Float(v1, v2) => ExpressionTerm::FloatLiteral(v1 + v2),
-                    NumericBinaryOperands::Double(v1, v2) => ExpressionTerm::DoubleLiteral(v1 + v2),
-                    NumericBinaryOperands::Integer(v1, v2) => {
-                        ExpressionTerm::IntegerLiteral(v1.checked_add(v2)?)
-                    }
-                    NumericBinaryOperands::Decimal(v1, v2) => {
-                        ExpressionTerm::DecimalLiteral(v1.checked_add(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::Duration(v1, v2) => {
-                        ExpressionTerm::DurationLiteral(v1.checked_add(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::YearMonthDuration(v1, v2) => {
-                        ExpressionTerm::YearMonthDurationLiteral(v1.checked_add(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DayTimeDuration(v1, v2) => {
-                        ExpressionTerm::DayTimeDurationLiteral(v1.checked_add(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTimeDuration(v1, v2) => {
-                        ExpressionTerm::DateTimeLiteral(v1.checked_add_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTimeYearMonthDuration(v1, v2) => {
-                        ExpressionTerm::DateTimeLiteral(v1.checked_add_year_month_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTimeDayTimeDuration(v1, v2) => {
-                        ExpressionTerm::DateTimeLiteral(v1.checked_add_day_time_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateDuration(v1, v2) => {
-                        ExpressionTerm::DateLiteral(v1.checked_add_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateYearMonthDuration(v1, v2) => {
-                        ExpressionTerm::DateLiteral(v1.checked_add_year_month_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateDayTimeDuration(v1, v2) => {
-                        ExpressionTerm::DateLiteral(v1.checked_add_day_time_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::TimeDuration(v1, v2) => {
-                        ExpressionTerm::TimeLiteral(v1.checked_add_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::TimeDayTimeDuration(v1, v2) => {
-                        ExpressionTerm::TimeLiteral(v1.checked_add_day_time_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTime(_, _)
-                    | NumericBinaryOperands::Time(_, _)
-                    | NumericBinaryOperands::Date(_, _) => return None,
-                })
-            })
-        }
-        Expression::Subtract(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some(match NumericBinaryOperands::new(a(tuple)?, b(tuple)?)? {
-                    NumericBinaryOperands::Float(v1, v2) => ExpressionTerm::FloatLiteral(v1 - v2),
-                    NumericBinaryOperands::Double(v1, v2) => ExpressionTerm::DoubleLiteral(v1 - v2),
-                    NumericBinaryOperands::Integer(v1, v2) => {
-                        ExpressionTerm::IntegerLiteral(v1.checked_sub(v2)?)
-                    }
-                    NumericBinaryOperands::Decimal(v1, v2) => {
-                        ExpressionTerm::DecimalLiteral(v1.checked_sub(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTime(v1, v2) => {
-                        ExpressionTerm::DayTimeDurationLiteral(v1.checked_sub(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::Date(v1, v2) => {
-                        ExpressionTerm::DayTimeDurationLiteral(v1.checked_sub(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::Time(v1, v2) => {
-                        ExpressionTerm::DayTimeDurationLiteral(v1.checked_sub(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::Duration(v1, v2) => {
-                        ExpressionTerm::DurationLiteral(v1.checked_sub(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::YearMonthDuration(v1, v2) => {
-                        ExpressionTerm::YearMonthDurationLiteral(v1.checked_sub(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DayTimeDuration(v1, v2) => {
-                        ExpressionTerm::DayTimeDurationLiteral(v1.checked_sub(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTimeDuration(v1, v2) => {
-                        ExpressionTerm::DateTimeLiteral(v1.checked_sub_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTimeYearMonthDuration(v1, v2) => {
-                        ExpressionTerm::DateTimeLiteral(v1.checked_sub_year_month_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateTimeDayTimeDuration(v1, v2) => {
-                        ExpressionTerm::DateTimeLiteral(v1.checked_sub_day_time_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateDuration(v1, v2) => {
-                        ExpressionTerm::DateLiteral(v1.checked_sub_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateYearMonthDuration(v1, v2) => {
-                        ExpressionTerm::DateLiteral(v1.checked_sub_year_month_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::DateDayTimeDuration(v1, v2) => {
-                        ExpressionTerm::DateLiteral(v1.checked_sub_day_time_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::TimeDuration(v1, v2) => {
-                        ExpressionTerm::TimeLiteral(v1.checked_sub_duration(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    NumericBinaryOperands::TimeDayTimeDuration(v1, v2) => {
-                        ExpressionTerm::TimeLiteral(v1.checked_sub_day_time_duration(v2)?)
-                    }
-                })
-            })
-        }
-        Expression::Multiply(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some(match NumericBinaryOperands::new(a(tuple)?, b(tuple)?)? {
-                    NumericBinaryOperands::Float(v1, v2) => ExpressionTerm::FloatLiteral(v1 * v2),
-                    NumericBinaryOperands::Double(v1, v2) => ExpressionTerm::DoubleLiteral(v1 * v2),
-                    NumericBinaryOperands::Integer(v1, v2) => {
-                        ExpressionTerm::IntegerLiteral(v1.checked_mul(v2)?)
-                    }
-                    NumericBinaryOperands::Decimal(v1, v2) => {
-                        ExpressionTerm::DecimalLiteral(v1.checked_mul(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    _ => return None,
-                })
-            })
-        }
-        Expression::Divide(a, b) => {
-            let a = build_expression_evaluator(a, context)?;
-            let b = build_expression_evaluator(b, context)?;
-            Rc::new(move |tuple| {
-                Some(match NumericBinaryOperands::new(a(tuple)?, b(tuple)?)? {
-                    NumericBinaryOperands::Float(v1, v2) => ExpressionTerm::FloatLiteral(v1 / v2),
-                    NumericBinaryOperands::Double(v1, v2) => ExpressionTerm::DoubleLiteral(v1 / v2),
-                    NumericBinaryOperands::Integer(v1, v2) => {
-                        ExpressionTerm::DecimalLiteral(Decimal::from(v1).checked_div(v2)?)
-                    }
-                    NumericBinaryOperands::Decimal(v1, v2) => {
-                        ExpressionTerm::DecimalLiteral(v1.checked_div(v2)?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    _ => return None,
-                })
-            })
-        }
-        Expression::UnaryPlus(e) => {
-            let e = build_expression_evaluator(e, context)?;
-            Rc::new(move |tuple| {
-                Some(match e(tuple)? {
-                    ExpressionTerm::FloatLiteral(value) => ExpressionTerm::FloatLiteral(value),
-                    ExpressionTerm::DoubleLiteral(value) => ExpressionTerm::DoubleLiteral(value),
-                    ExpressionTerm::IntegerLiteral(value) => ExpressionTerm::IntegerLiteral(value),
-                    ExpressionTerm::DecimalLiteral(value) => ExpressionTerm::DecimalLiteral(value),
-                    #[cfg(feature = "sep-0002")]
-                    ExpressionTerm::DurationLiteral(value) => {
-                        ExpressionTerm::DurationLiteral(value)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    ExpressionTerm::YearMonthDurationLiteral(value) => {
-                        ExpressionTerm::YearMonthDurationLiteral(value)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    ExpressionTerm::DayTimeDurationLiteral(value) => {
-                        ExpressionTerm::DayTimeDurationLiteral(value)
-                    }
-                    _ => return None,
-                })
-            })
-        }
-        Expression::UnaryMinus(e) => {
-            let e = build_expression_evaluator(e, context)?;
-            Rc::new(move |tuple| {
-                Some(match e(tuple)? {
-                    ExpressionTerm::FloatLiteral(value) => ExpressionTerm::FloatLiteral(-value),
-                    ExpressionTerm::DoubleLiteral(value) => ExpressionTerm::DoubleLiteral(-value),
-                    ExpressionTerm::IntegerLiteral(value) => {
-                        ExpressionTerm::IntegerLiteral(value.checked_neg()?)
-                    }
-                    ExpressionTerm::DecimalLiteral(value) => {
-                        ExpressionTerm::DecimalLiteral(value.checked_neg()?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    ExpressionTerm::DurationLiteral(value) => {
-                        ExpressionTerm::DurationLiteral(value.checked_neg()?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    ExpressionTerm::YearMonthDurationLiteral(value) => {
-                        ExpressionTerm::YearMonthDurationLiteral(value.checked_neg()?)
-                    }
-                    #[cfg(feature = "sep-0002")]
-                    ExpressionTerm::DayTimeDurationLiteral(value) => {
-                        ExpressionTerm::DayTimeDurationLiteral(value.checked_neg()?)
-                    }
-                    _ => return None,
-                })
-            })
-        }
-        Expression::Not(e) => {
-            let e = build_expression_evaluator(e, context)?;
-            Rc::new(move |tuple| Some((!e(tuple)?.effective_boolean_value()?).into()))
         }
         Expression::Coalesce(l) => {
             let l = l
@@ -444,11 +164,11 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                 .collect::<Result<Vec<_>, _>>()?;
             Rc::new(move |tuple| {
                 for e in &l {
-                    if let Some(result) = e(tuple) {
-                        return Some(result);
+                    if let Some(result) = e(tuple)? {
+                        return Ok(Some(result));
                     }
                 }
-                None
+                Ok(None)
             })
         }
         Expression::If(a, b, c) => {
@@ -456,57 +176,539 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
             let b = build_expression_evaluator(b, context)?;
             let c = build_expression_evaluator(c, context)?;
             Rc::new(move |tuple| {
-                if a(tuple)?.effective_boolean_value()? {
+                if try_or_ok!(try_or_ok!(a(tuple)?).effective_boolean_value()) {
                     b(tuple)
                 } else {
                     c(tuple)
                 }
             })
         }
-        Expression::FunctionCall(function, parameters) => match function {
-            Function::Str => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::StringLiteral(match e(tuple)?.into() {
-                        Term::NamedNode(term) => term.into_string(),
-                        Term::BlankNode(_) => return None,
-                        Term::Literal(term) => term.into_value(),
-                        #[cfg(feature = "sparql-12")]
-                        Term::Triple(_) => return None,
-                    }))
-                })
+        Expression::FunctionCall(function, parameters) => {
+            if *function == sparql::LOGICAL_NOT {
+                let [e] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(e, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        (!try_or_ok!(try_or_ok!(e(tuple)?).effective_boolean_value())).into(),
+                    ))
+                }));
             }
-            Function::Lang => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::StringLiteral(match e(tuple)? {
-                        ExpressionTerm::LangStringLiteral { language, .. } => language,
-                        #[cfg(feature = "sparql-12")]
-                        ExpressionTerm::DirLangStringLiteral { language, .. } => language,
-                        ExpressionTerm::NamedNode(_) | ExpressionTerm::BlankNode(_) => {
-                            return None;
+            if *function == sparql::EQUALS {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(equals(&try_or_ok!(a(tuple)?), &try_or_ok!(b(tuple)?)).map(Into::into))
+                }));
+            }
+            if *function == sparql::NOT_EQUALS {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(equals(&try_or_ok!(a(tuple)?), &try_or_ok!(b(tuple)?)).map(|v| (!v).into()))
+                }));
+            }
+            if *function == sparql::SAME_TERM {
+                let [a, b] = extract_parameters(function, parameters)?;
+                match (
+                    try_build_internal_expression_evaluator(a, context)?,
+                    try_build_internal_expression_evaluator(b, context)?,
+                ) {
+                    (Some(a), Some(b)) => {
+                        return Ok(Rc::new(move |tuple| {
+                            Ok(Some(
+                                (try_or_ok!(a(tuple)?) == try_or_ok!(b(tuple)?)).into(),
+                            ))
+                        }));
+                    }
+                    (Some(a), None) => {
+                        let b = build_expression_evaluator(b, context)?;
+                        let internalize = context.build_internalize_expression_term();
+                        return Ok(Rc::new(move |tuple| {
+                            Ok(Some(
+                                (try_or_ok!(a(tuple)?) == internalize(try_or_ok!(b(tuple)?))?)
+                                    .into(),
+                            ))
+                        }));
+                    }
+                    (None, Some(b)) => {
+                        let a = build_expression_evaluator(a, context)?;
+                        let internalize = context.build_internalize_expression_term();
+                        return Ok(Rc::new(move |tuple| {
+                            Ok(Some(
+                                (internalize(try_or_ok!(a(tuple)?))? == try_or_ok!(b(tuple)?))
+                                    .into(),
+                            ))
+                        }));
+                    }
+                    (None, None) => {
+                        let a = build_expression_evaluator(a, context)?;
+                        let b = build_expression_evaluator(b, context)?;
+                        return Ok(Rc::new(move |tuple| {
+                            Ok(Some(
+                                (try_or_ok!(a(tuple)?) == try_or_ok!(b(tuple)?)).into(),
+                            ))
+                        }));
+                    }
+                }
+            }
+            if *function == sparql::GREATER_THAN {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        (try_or_ok!(partial_cmp(&try_or_ok!(a(tuple)?), &try_or_ok!(b(tuple)?)))
+                            == Ordering::Greater)
+                            .into(),
+                    ))
+                }));
+            }
+            if *function == sparql::GREATER_THAN_OR_EQUAL {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        match try_or_ok!(partial_cmp(
+                            &try_or_ok!(a(tuple)?),
+                            &try_or_ok!(b(tuple)?)
+                        )) {
+                            Ordering::Greater | Ordering::Equal => true,
+                            Ordering::Less => false,
                         }
-                        #[cfg(feature = "sparql-12")]
-                        ExpressionTerm::Triple(_) => return None,
-                        _ => OxString::default(),
-                    }))
-                })
+                        .into(),
+                    ))
+                }));
             }
-            Function::LangMatches => {
-                let language_tag = build_expression_evaluator(&parameters[0], context)?;
-                let language_range = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let ExpressionTerm::StringLiteral(mut language_tag) = language_tag(tuple)?
+            if *function == sparql::LESS_THAN {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        (try_or_ok!(partial_cmp(&try_or_ok!(a(tuple)?), &try_or_ok!(b(tuple)?)))
+                            == Ordering::Less)
+                            .into(),
+                    ))
+                }));
+            }
+            if *function == sparql::LESS_THAN_OR_EQUAL {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        match try_or_ok!(partial_cmp(
+                            &try_or_ok!(a(tuple)?),
+                            &try_or_ok!(b(tuple)?)
+                        )) {
+                            Ordering::Less | Ordering::Equal => true,
+                            Ordering::Greater => false,
+                        }
+                        .into(),
+                    ))
+                }));
+            }
+            if *function == sparql::ADD {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        match try_or_ok!(NumericBinaryOperands::new(
+                            try_or_ok!(a(tuple)?),
+                            try_or_ok!(b(tuple)?),
+                        )) {
+                            NumericBinaryOperands::Float(v1, v2) => {
+                                ExpressionTerm::FloatLiteral(v1 + v2)
+                            }
+                            NumericBinaryOperands::Double(v1, v2) => {
+                                ExpressionTerm::DoubleLiteral(v1 + v2)
+                            }
+                            NumericBinaryOperands::Integer(v1, v2) => {
+                                ExpressionTerm::IntegerLiteral(try_or_ok!(v1.checked_add(v2)))
+                            }
+                            NumericBinaryOperands::Decimal(v1, v2) => {
+                                ExpressionTerm::DecimalLiteral(try_or_ok!(v1.checked_add(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::Duration(v1, v2) => {
+                                ExpressionTerm::DurationLiteral(try_or_ok!(v1.checked_add(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::YearMonthDuration(v1, v2) => {
+                                ExpressionTerm::YearMonthDurationLiteral(try_or_ok!(
+                                    v1.checked_add(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DayTimeDuration(v1, v2) => {
+                                ExpressionTerm::DayTimeDurationLiteral(try_or_ok!(
+                                    v1.checked_add(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTimeDuration(v1, v2) => {
+                                ExpressionTerm::DateTimeLiteral(try_or_ok!(
+                                    v1.checked_add_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTimeYearMonthDuration(v1, v2) => {
+                                ExpressionTerm::DateTimeLiteral(try_or_ok!(
+                                    v1.checked_add_year_month_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTimeDayTimeDuration(v1, v2) => {
+                                ExpressionTerm::DateTimeLiteral(try_or_ok!(
+                                    v1.checked_add_day_time_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateDuration(v1, v2) => {
+                                ExpressionTerm::DateLiteral(try_or_ok!(v1.checked_add_duration(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateYearMonthDuration(v1, v2) => {
+                                ExpressionTerm::DateLiteral(try_or_ok!(
+                                    v1.checked_add_year_month_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateDayTimeDuration(v1, v2) => {
+                                ExpressionTerm::DateLiteral(try_or_ok!(
+                                    v1.checked_add_day_time_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::TimeDuration(v1, v2) => {
+                                ExpressionTerm::TimeLiteral(try_or_ok!(v1.checked_add_duration(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::TimeDayTimeDuration(v1, v2) => {
+                                ExpressionTerm::TimeLiteral(try_or_ok!(
+                                    v1.checked_add_day_time_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTime(_, _)
+                            | NumericBinaryOperands::Time(_, _)
+                            | NumericBinaryOperands::Date(_, _) => return Ok(None),
+                        },
+                    ))
+                }));
+            }
+            if *function == sparql::SUBTRACT {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        match try_or_ok!(NumericBinaryOperands::new(
+                            try_or_ok!(a(tuple)?),
+                            try_or_ok!(b(tuple)?),
+                        )) {
+                            NumericBinaryOperands::Float(v1, v2) => {
+                                ExpressionTerm::FloatLiteral(v1 - v2)
+                            }
+                            NumericBinaryOperands::Double(v1, v2) => {
+                                ExpressionTerm::DoubleLiteral(v1 - v2)
+                            }
+                            NumericBinaryOperands::Integer(v1, v2) => {
+                                ExpressionTerm::IntegerLiteral(try_or_ok!(v1.checked_sub(v2)))
+                            }
+                            NumericBinaryOperands::Decimal(v1, v2) => {
+                                ExpressionTerm::DecimalLiteral(try_or_ok!(v1.checked_sub(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTime(v1, v2) => {
+                                ExpressionTerm::DayTimeDurationLiteral(try_or_ok!(
+                                    v1.checked_sub(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::Date(v1, v2) => {
+                                ExpressionTerm::DayTimeDurationLiteral(try_or_ok!(
+                                    v1.checked_sub(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::Time(v1, v2) => {
+                                ExpressionTerm::DayTimeDurationLiteral(try_or_ok!(
+                                    v1.checked_sub(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::Duration(v1, v2) => {
+                                ExpressionTerm::DurationLiteral(try_or_ok!(v1.checked_sub(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::YearMonthDuration(v1, v2) => {
+                                ExpressionTerm::YearMonthDurationLiteral(try_or_ok!(
+                                    v1.checked_sub(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DayTimeDuration(v1, v2) => {
+                                ExpressionTerm::DayTimeDurationLiteral(try_or_ok!(
+                                    v1.checked_sub(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTimeDuration(v1, v2) => {
+                                ExpressionTerm::DateTimeLiteral(try_or_ok!(
+                                    v1.checked_sub_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTimeYearMonthDuration(v1, v2) => {
+                                ExpressionTerm::DateTimeLiteral(try_or_ok!(
+                                    v1.checked_sub_year_month_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateTimeDayTimeDuration(v1, v2) => {
+                                ExpressionTerm::DateTimeLiteral(try_or_ok!(
+                                    v1.checked_sub_day_time_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateDuration(v1, v2) => {
+                                ExpressionTerm::DateLiteral(try_or_ok!(v1.checked_sub_duration(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateYearMonthDuration(v1, v2) => {
+                                ExpressionTerm::DateLiteral(try_or_ok!(
+                                    v1.checked_sub_year_month_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::DateDayTimeDuration(v1, v2) => {
+                                ExpressionTerm::DateLiteral(try_or_ok!(
+                                    v1.checked_sub_day_time_duration(v2)
+                                ))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::TimeDuration(v1, v2) => {
+                                ExpressionTerm::TimeLiteral(try_or_ok!(v1.checked_sub_duration(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            NumericBinaryOperands::TimeDayTimeDuration(v1, v2) => {
+                                ExpressionTerm::TimeLiteral(try_or_ok!(
+                                    v1.checked_sub_day_time_duration(v2)
+                                ))
+                            }
+                        },
+                    ))
+                }));
+            }
+            if *function == sparql::MULTIPLY {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        match try_or_ok!(NumericBinaryOperands::new(
+                            try_or_ok!(a(tuple)?),
+                            try_or_ok!(b(tuple)?),
+                        )) {
+                            NumericBinaryOperands::Float(v1, v2) => {
+                                ExpressionTerm::FloatLiteral(v1 * v2)
+                            }
+                            NumericBinaryOperands::Double(v1, v2) => {
+                                ExpressionTerm::DoubleLiteral(v1 * v2)
+                            }
+                            NumericBinaryOperands::Integer(v1, v2) => {
+                                ExpressionTerm::IntegerLiteral(try_or_ok!(v1.checked_mul(v2)))
+                            }
+                            NumericBinaryOperands::Decimal(v1, v2) => {
+                                ExpressionTerm::DecimalLiteral(try_or_ok!(v1.checked_mul(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            _ => return Ok(None),
+                        },
+                    ))
+                }));
+            }
+            if *function == sparql::DIVIDE {
+                let [a, b] = extract_parameters(function, parameters)?;
+                let a = build_expression_evaluator(a, context)?;
+                let b = build_expression_evaluator(b, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        match try_or_ok!(NumericBinaryOperands::new(
+                            try_or_ok!(a(tuple)?),
+                            try_or_ok!(b(tuple)?),
+                        )) {
+                            NumericBinaryOperands::Float(v1, v2) => {
+                                ExpressionTerm::FloatLiteral(v1 / v2)
+                            }
+                            NumericBinaryOperands::Double(v1, v2) => {
+                                ExpressionTerm::DoubleLiteral(v1 / v2)
+                            }
+                            NumericBinaryOperands::Integer(v1, v2) => {
+                                ExpressionTerm::DecimalLiteral(try_or_ok!(
+                                    Decimal::from(v1).checked_div(v2)
+                                ))
+                            }
+                            NumericBinaryOperands::Decimal(v1, v2) => {
+                                ExpressionTerm::DecimalLiteral(try_or_ok!(v1.checked_div(v2)))
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            _ => return Ok(None),
+                        },
+                    ))
+                }));
+            }
+            if *function == sparql::UNARY_PLUS {
+                let [e] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(e, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(match try_or_ok!(e(tuple)?) {
+                        ExpressionTerm::FloatLiteral(value) => ExpressionTerm::FloatLiteral(value),
+                        ExpressionTerm::DoubleLiteral(value) => {
+                            ExpressionTerm::DoubleLiteral(value)
+                        }
+                        ExpressionTerm::IntegerLiteral(value) => {
+                            ExpressionTerm::IntegerLiteral(value)
+                        }
+                        ExpressionTerm::DecimalLiteral(value) => {
+                            ExpressionTerm::DecimalLiteral(value)
+                        }
+                        #[cfg(feature = "sep-0002")]
+                        ExpressionTerm::DurationLiteral(value) => {
+                            ExpressionTerm::DurationLiteral(value)
+                        }
+                        #[cfg(feature = "sep-0002")]
+                        ExpressionTerm::YearMonthDurationLiteral(value) => {
+                            ExpressionTerm::YearMonthDurationLiteral(value)
+                        }
+                        #[cfg(feature = "sep-0002")]
+                        ExpressionTerm::DayTimeDurationLiteral(value) => {
+                            ExpressionTerm::DayTimeDurationLiteral(value)
+                        }
+                        _ => return Ok(None),
+                    }))
+                }));
+            }
+            if *function == sparql::UNARY_MINUS {
+                let [e] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(e, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(match try_or_ok!(e(tuple)?) {
+                        ExpressionTerm::FloatLiteral(value) => ExpressionTerm::FloatLiteral(-value),
+                        ExpressionTerm::DoubleLiteral(value) => {
+                            ExpressionTerm::DoubleLiteral(-value)
+                        }
+                        ExpressionTerm::IntegerLiteral(value) => {
+                            ExpressionTerm::IntegerLiteral(try_or_ok!(value.checked_neg()))
+                        }
+                        ExpressionTerm::DecimalLiteral(value) => {
+                            ExpressionTerm::DecimalLiteral(try_or_ok!(value.checked_neg()))
+                        }
+                        #[cfg(feature = "sep-0002")]
+                        ExpressionTerm::DurationLiteral(value) => {
+                            ExpressionTerm::DurationLiteral(try_or_ok!(value.checked_neg()))
+                        }
+                        #[cfg(feature = "sep-0002")]
+                        ExpressionTerm::YearMonthDurationLiteral(value) => {
+                            ExpressionTerm::YearMonthDurationLiteral(try_or_ok!(
+                                value.checked_neg()
+                            ))
+                        }
+                        #[cfg(feature = "sep-0002")]
+                        ExpressionTerm::DayTimeDurationLiteral(value) => {
+                            ExpressionTerm::DayTimeDurationLiteral(try_or_ok!(value.checked_neg()))
+                        }
+                        _ => return Ok(None),
+                    }))
+                }));
+            }
+            if let Some(function) = context.custom_functions().get(function).cloned() {
+                let args = parameters
+                    .iter()
+                    .map(|e| build_expression_evaluator(e, context))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(Rc::new(move |tuple| {
+                    let mut values = Vec::with_capacity(args.len());
+                    for evaluator in &args {
+                        values.push(try_or_ok!(evaluator(tuple)?).into());
+                    }
+                    Ok(function(&values).map(Into::into))
+                }));
+            }
+            if *function == sparql::STR {
+                let [p] = extract_parameters(function, parameters)?;
+                return Ok(
+                    if let Some(e) = try_build_internal_expression_evaluator(p, context)? {
+                        let externalize = context.build_externalize_term();
+                        Rc::new(move |tuple| {
+                            Ok(Some(ExpressionTerm::StringLiteral(
+                                match externalize(try_or_ok!(e(tuple)?))? {
+                                    Term::NamedNode(term) => term.into_string(),
+                                    Term::BlankNode(_) => return Ok(None),
+                                    Term::Literal(term) => term.into_value(),
+                                    #[cfg(feature = "sparql-12")]
+                                    Term::Triple(_) => return Ok(None),
+                                },
+                            )))
+                        })
+                    } else {
+                        let e = build_expression_evaluator(p, context)?;
+                        Rc::new(move |tuple| {
+                            Ok(Some(ExpressionTerm::StringLiteral(
+                                match try_or_ok!(e(tuple)?).into() {
+                                    Term::NamedNode(term) => term.into_string(),
+                                    Term::BlankNode(_) => return Ok(None),
+                                    Term::Literal(term) => term.into_value(),
+                                    #[cfg(feature = "sparql-12")]
+                                    Term::Triple(_) => return Ok(None),
+                                },
+                            )))
+                        })
+                    },
+                );
+            }
+            if *function == sparql::LANG {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::StringLiteral(
+                        match try_or_ok!(e(tuple)?) {
+                            ExpressionTerm::LangStringLiteral { language, .. } => language,
+                            #[cfg(feature = "sparql-12")]
+                            ExpressionTerm::DirLangStringLiteral { language, .. } => language,
+                            ExpressionTerm::NamedNode(_) | ExpressionTerm::BlankNode(_) => {
+                                return Ok(None);
+                            }
+                            #[cfg(feature = "sparql-12")]
+                            ExpressionTerm::Triple(_) => return Ok(None),
+                            _ => OxString::default(),
+                        },
+                    )))
+                }));
+            }
+            if *function == sparql::LANG_MATCHES {
+                let [language_tag, language_range] = extract_parameters(function, parameters)?;
+                let language_tag = build_expression_evaluator(language_tag, context)?;
+                let language_range = build_expression_evaluator(language_range, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let ExpressionTerm::StringLiteral(mut language_tag) =
+                        try_or_ok!(language_tag(tuple)?)
                     else {
-                        return None;
+                        return Ok(None);
                     };
                     language_tag.make_mut().make_ascii_lowercase();
-                    let ExpressionTerm::StringLiteral(mut language_range) = language_range(tuple)?
+                    let ExpressionTerm::StringLiteral(mut language_range) =
+                        try_or_ok!(language_range(tuple)?)
                     else {
-                        return None;
+                        return Ok(None);
                     };
                     language_range.make_mut().make_ascii_lowercase();
-                    Some(
+                    Ok(Some(
                         if &*language_range == "*" {
                             !language_tag.is_empty()
                         } else {
@@ -520,184 +722,219 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                                 })
                         }
                         .into(),
-                    )
-                })
+                    ))
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::LangDir => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::StringLiteral(match e(tuple)? {
-                        ExpressionTerm::DirLangStringLiteral { direction, .. } => match direction {
-                            BaseDirection::Ltr => "ltr".into(),
-                            BaseDirection::Rtl => "rtl".into(),
+            if *function == sparql::LANGDIR {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::StringLiteral(
+                        match try_or_ok!(e(tuple)?) {
+                            ExpressionTerm::DirLangStringLiteral { direction, .. } => {
+                                match direction {
+                                    BaseDirection::Ltr => "ltr".into(),
+                                    BaseDirection::Rtl => "rtl".into(),
+                                }
+                            }
+                            ExpressionTerm::NamedNode(_) | ExpressionTerm::BlankNode(_) => {
+                                return Ok(None);
+                            }
+                            #[cfg(feature = "sparql-12")]
+                            ExpressionTerm::Triple(_) => return Ok(None),
+                            _ => OxString::default(),
                         },
-                        ExpressionTerm::NamedNode(_) | ExpressionTerm::BlankNode(_) => {
-                            return None;
-                        }
-                        #[cfg(feature = "sparql-12")]
-                        ExpressionTerm::Triple(_) => return None,
-                        _ => OxString::default(),
-                    }))
-                })
+                    )))
+                }));
             }
-            Function::Datatype => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::NamedNode(match e(tuple)? {
-                        ExpressionTerm::StringLiteral(_) => xsd::STRING,
-                        ExpressionTerm::LangStringLiteral { .. } => rdf::LANG_STRING,
-                        #[cfg(feature = "sparql-12")]
-                        ExpressionTerm::DirLangStringLiteral { .. } => rdf::DIR_LANG_STRING,
-                        ExpressionTerm::BooleanLiteral(_) => xsd::BOOLEAN,
-                        ExpressionTerm::IntegerLiteral(_) => xsd::INTEGER,
-                        ExpressionTerm::DecimalLiteral(_) => xsd::DECIMAL,
-                        ExpressionTerm::FloatLiteral(_) => xsd::FLOAT,
-                        ExpressionTerm::DoubleLiteral(_) => xsd::DOUBLE,
-                        ExpressionTerm::DateTimeLiteral(_) => xsd::DATE_TIME,
-                        #[cfg(feature = "sep-0002")]
-                        ExpressionTerm::DateLiteral(_) => xsd::DATE,
-                        #[cfg(feature = "sep-0002")]
-                        ExpressionTerm::TimeLiteral(_) => xsd::TIME,
-                        #[cfg(feature = "calendar-ext")]
-                        ExpressionTerm::GYearLiteral(_) => xsd::G_YEAR,
-                        #[cfg(feature = "calendar-ext")]
-                        ExpressionTerm::GYearMonthLiteral(_) => xsd::G_YEAR_MONTH,
-                        #[cfg(feature = "calendar-ext")]
-                        ExpressionTerm::GMonthLiteral(_) => xsd::G_MONTH,
-                        #[cfg(feature = "calendar-ext")]
-                        ExpressionTerm::GMonthDayLiteral(_) => xsd::G_MONTH_DAY,
-                        #[cfg(feature = "calendar-ext")]
-                        ExpressionTerm::GDayLiteral(_) => xsd::G_DAY,
-                        #[cfg(feature = "sep-0002")]
-                        ExpressionTerm::DurationLiteral(_) => xsd::DURATION,
-                        #[cfg(feature = "sep-0002")]
-                        ExpressionTerm::YearMonthDurationLiteral(_) => xsd::YEAR_MONTH_DURATION,
-                        #[cfg(feature = "sep-0002")]
-                        ExpressionTerm::DayTimeDurationLiteral(_) => xsd::DAY_TIME_DURATION,
-                        ExpressionTerm::OtherTypedLiteral { datatype, .. } => datatype,
-                        ExpressionTerm::NamedNode(_) | ExpressionTerm::BlankNode(_) => {
-                            return None;
-                        }
-                        #[cfg(feature = "sparql-12")]
-                        ExpressionTerm::Triple(_) => return None,
-                    }))
-                })
+            if *function == sparql::DATATYPE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::NamedNode(
+                        match try_or_ok!(e(tuple)?) {
+                            ExpressionTerm::StringLiteral(_) => xsd::STRING,
+                            ExpressionTerm::LangStringLiteral { .. } => rdf::LANG_STRING,
+                            #[cfg(feature = "sparql-12")]
+                            ExpressionTerm::DirLangStringLiteral { .. } => rdf::DIR_LANG_STRING,
+                            ExpressionTerm::BooleanLiteral(_) => xsd::BOOLEAN,
+                            ExpressionTerm::IntegerLiteral(_) => xsd::INTEGER,
+                            ExpressionTerm::DecimalLiteral(_) => xsd::DECIMAL,
+                            ExpressionTerm::FloatLiteral(_) => xsd::FLOAT,
+                            ExpressionTerm::DoubleLiteral(_) => xsd::DOUBLE,
+                            ExpressionTerm::DateTimeLiteral(_) => xsd::DATE_TIME,
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::DateLiteral(_) => xsd::DATE,
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::TimeLiteral(_) => xsd::TIME,
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GYearLiteral(_) => xsd::G_YEAR,
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GYearMonthLiteral(_) => xsd::G_YEAR_MONTH,
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GMonthLiteral(_) => xsd::G_MONTH,
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GMonthDayLiteral(_) => xsd::G_MONTH_DAY,
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GDayLiteral(_) => xsd::G_DAY,
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::DurationLiteral(_) => xsd::DURATION,
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::YearMonthDurationLiteral(_) => xsd::YEAR_MONTH_DURATION,
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::DayTimeDurationLiteral(_) => xsd::DAY_TIME_DURATION,
+                            ExpressionTerm::OtherTypedLiteral { datatype, .. } => datatype,
+                            ExpressionTerm::NamedNode(_) | ExpressionTerm::BlankNode(_) => {
+                                return Ok(None);
+                            }
+                            #[cfg(feature = "sparql-12")]
+                            ExpressionTerm::Triple(_) => return Ok(None),
+                        },
+                    )))
+                }));
             }
-            Function::Iri => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
+            if *function == sparql::IRI || *function == sparql::URI {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
                 let base_iri = context.base_iri();
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::NamedNode(match e(tuple)? {
-                        ExpressionTerm::NamedNode(iri) => iri,
-                        ExpressionTerm::StringLiteral(iri) => {
-                            NamedNode::new_unchecked(if let Some(base_iri) = &base_iri {
-                                OxString::new_owned(&base_iri.resolve(&iri).ok()?.into_inner())
-                            } else {
-                                Iri::parse(iri).ok()?.into_inner()
-                            })
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::NamedNode(
+                        match try_or_ok!(e(tuple)?) {
+                            ExpressionTerm::NamedNode(iri) => iri,
+                            ExpressionTerm::StringLiteral(iri) => {
+                                let iri = try_or_ok!(IriRef::parse(iri).ok());
+                                NamedNode::new_unchecked(if iri.is_absolute() {
+                                    iri.into_inner()
+                                } else if let Some(base_iri) = &base_iri {
+                                    OxString::new_owned(
+                                        &try_or_ok!(base_iri.resolve(&iri).ok()).into_inner(),
+                                    )
+                                } else {
+                                    return Ok(None);
+                                })
+                            }
+                            _ => return Ok(None),
+                        },
+                    )))
+                }));
+            }
+            if *function == sparql::BNODE {
+                return Ok(match parameters.first() {
+                    Some(id) => {
+                        let id = build_expression_evaluator(id, context)?;
+                        Rc::new(move |tuple| {
+                            let ExpressionTerm::StringLiteral(id) = try_or_ok!(id(tuple)?) else {
+                                return Ok(None);
+                            };
+                            Ok(Some(ExpressionTerm::BlankNode(try_or_ok!(
+                                BlankNode::new(id).ok()
+                            ))))
+                        })
+                    }
+                    None => Rc::new(|_| Ok(Some(ExpressionTerm::BlankNode(BlankNode::default())))),
+                });
+            }
+            if *function == sparql::RAND {
+                return Ok(Rc::new(|_| {
+                    Ok(Some(ExpressionTerm::DoubleLiteral(random::<f64>().into())))
+                }));
+            }
+            if *function == sparql::ABS {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(match try_or_ok!(e(tuple)?) {
+                        ExpressionTerm::IntegerLiteral(value) => Some(
+                            ExpressionTerm::IntegerLiteral(try_or_ok!(value.checked_abs())),
+                        ),
+                        ExpressionTerm::DecimalLiteral(value) => Some(
+                            ExpressionTerm::DecimalLiteral(try_or_ok!(value.checked_abs())),
+                        ),
+                        ExpressionTerm::FloatLiteral(value) => {
+                            Some(ExpressionTerm::FloatLiteral(value.abs()))
                         }
-                        _ => return None,
-                    }))
-                })
-            }
-            Function::BNode => match parameters.first() {
-                Some(id) => {
-                    let id = build_expression_evaluator(id, context)?;
-                    Rc::new(move |tuple| {
-                        let ExpressionTerm::StringLiteral(id) = id(tuple)? else {
-                            return None;
-                        };
-                        Some(ExpressionTerm::BlankNode(BlankNode::new(id).ok()?))
+                        ExpressionTerm::DoubleLiteral(value) => {
+                            Some(ExpressionTerm::DoubleLiteral(value.abs()))
+                        }
+                        _ => None,
                     })
-                }
-                None => Rc::new(|_| Some(ExpressionTerm::BlankNode(BlankNode::default()))),
-            },
-            Function::Rand => {
-                Rc::new(|_| Some(ExpressionTerm::DoubleLiteral(random::<f64>().into())))
+                }));
             }
-            Function::Abs => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| match e(tuple)? {
-                    ExpressionTerm::IntegerLiteral(value) => {
-                        Some(ExpressionTerm::IntegerLiteral(value.checked_abs()?))
-                    }
-                    ExpressionTerm::DecimalLiteral(value) => {
-                        Some(ExpressionTerm::DecimalLiteral(value.checked_abs()?))
-                    }
-                    ExpressionTerm::FloatLiteral(value) => {
-                        Some(ExpressionTerm::FloatLiteral(value.abs()))
-                    }
-                    ExpressionTerm::DoubleLiteral(value) => {
-                        Some(ExpressionTerm::DoubleLiteral(value.abs()))
-                    }
-                    _ => None,
-                })
+            if *function == sparql::CEIL {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(match try_or_ok!(e(tuple)?) {
+                        ExpressionTerm::IntegerLiteral(value) => {
+                            Some(ExpressionTerm::IntegerLiteral(value))
+                        }
+                        ExpressionTerm::DecimalLiteral(value) => Some(
+                            ExpressionTerm::DecimalLiteral(try_or_ok!(value.checked_ceil())),
+                        ),
+                        ExpressionTerm::FloatLiteral(value) => {
+                            Some(ExpressionTerm::FloatLiteral(value.ceil()))
+                        }
+                        ExpressionTerm::DoubleLiteral(value) => {
+                            Some(ExpressionTerm::DoubleLiteral(value.ceil()))
+                        }
+                        _ => None,
+                    })
+                }));
             }
-            Function::Ceil => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| match e(tuple)? {
-                    ExpressionTerm::IntegerLiteral(value) => {
-                        Some(ExpressionTerm::IntegerLiteral(value))
-                    }
-                    ExpressionTerm::DecimalLiteral(value) => {
-                        Some(ExpressionTerm::DecimalLiteral(value.checked_ceil()?))
-                    }
-                    ExpressionTerm::FloatLiteral(value) => {
-                        Some(ExpressionTerm::FloatLiteral(value.ceil()))
-                    }
-                    ExpressionTerm::DoubleLiteral(value) => {
-                        Some(ExpressionTerm::DoubleLiteral(value.ceil()))
-                    }
-                    _ => None,
-                })
+            if *function == sparql::FLOOR {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(match try_or_ok!(e(tuple)?) {
+                        ExpressionTerm::IntegerLiteral(value) => {
+                            Some(ExpressionTerm::IntegerLiteral(value))
+                        }
+                        ExpressionTerm::DecimalLiteral(value) => Some(
+                            ExpressionTerm::DecimalLiteral(try_or_ok!(value.checked_floor())),
+                        ),
+                        ExpressionTerm::FloatLiteral(value) => {
+                            Some(ExpressionTerm::FloatLiteral(value.floor()))
+                        }
+                        ExpressionTerm::DoubleLiteral(value) => {
+                            Some(ExpressionTerm::DoubleLiteral(value.floor()))
+                        }
+                        _ => None,
+                    })
+                }));
             }
-            Function::Floor => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| match e(tuple)? {
-                    ExpressionTerm::IntegerLiteral(value) => {
-                        Some(ExpressionTerm::IntegerLiteral(value))
-                    }
-                    ExpressionTerm::DecimalLiteral(value) => {
-                        Some(ExpressionTerm::DecimalLiteral(value.checked_floor()?))
-                    }
-                    ExpressionTerm::FloatLiteral(value) => {
-                        Some(ExpressionTerm::FloatLiteral(value.floor()))
-                    }
-                    ExpressionTerm::DoubleLiteral(value) => {
-                        Some(ExpressionTerm::DoubleLiteral(value.floor()))
-                    }
-                    _ => None,
-                })
+            if *function == sparql::ROUND {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(match try_or_ok!(e(tuple)?) {
+                        ExpressionTerm::IntegerLiteral(value) => {
+                            Some(ExpressionTerm::IntegerLiteral(value))
+                        }
+                        ExpressionTerm::DecimalLiteral(value) => Some(
+                            ExpressionTerm::DecimalLiteral(try_or_ok!(value.checked_round())),
+                        ),
+                        ExpressionTerm::FloatLiteral(value) => {
+                            Some(ExpressionTerm::FloatLiteral(value.round()))
+                        }
+                        ExpressionTerm::DoubleLiteral(value) => {
+                            Some(ExpressionTerm::DoubleLiteral(value.round()))
+                        }
+                        _ => None,
+                    })
+                }));
             }
-            Function::Round => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| match e(tuple)? {
-                    ExpressionTerm::IntegerLiteral(value) => {
-                        Some(ExpressionTerm::IntegerLiteral(value))
-                    }
-                    ExpressionTerm::DecimalLiteral(value) => {
-                        Some(ExpressionTerm::DecimalLiteral(value.checked_round()?))
-                    }
-                    ExpressionTerm::FloatLiteral(value) => {
-                        Some(ExpressionTerm::FloatLiteral(value.round()))
-                    }
-                    ExpressionTerm::DoubleLiteral(value) => {
-                        Some(ExpressionTerm::DoubleLiteral(value.round()))
-                    }
-                    _ => None,
-                })
-            }
-            Function::Concat => {
+            if *function == sparql::CONCAT {
                 let l = parameters
                     .iter()
                     .map(|e| build_expression_evaluator(e, context))
                     .collect::<Result<Vec<_>, _>>()?;
-                Rc::new(move |tuple| {
+                return Ok(Rc::new(move |tuple| {
                     let mut args = Vec::with_capacity(l.len());
                     let mut language = None;
                     for e in &l {
-                        let (value, e_language) = to_string_and_language(e(tuple)?)?;
+                        let (value, e_language) =
+                            try_or_ok!(to_string_and_language(try_or_ok!(e(tuple)?)));
                         if let Some(lang) = &language {
                             if *lang != e_language {
                                 language = Some(None)
@@ -707,33 +944,45 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                         }
                         args.push(value);
                     }
-                    Some(build_plain_literal(
+                    Ok(Some(build_plain_literal(
                         OxString::concat(args),
                         language.flatten(),
-                    ))
-                })
+                    )))
+                }));
             }
-            Function::SubStr => {
-                let source = build_expression_evaluator(&parameters[0], context)?;
-                let starting_loc = build_expression_evaluator(&parameters[1], context)?;
-                let length = parameters
-                    .get(2)
+            if *function == sparql::SUBSTR {
+                let (source, starting_loc, length) = match parameters.as_slice() {
+                    [source, starting_loc] => (source, starting_loc, None),
+                    [source, starting_loc, length] => (source, starting_loc, Some(length)),
+                    _ => {
+                        return Err(ExpressionEvaluationError::UnsupportedFunctionArity {
+                            name: function.clone(),
+                            expected: 2..=3,
+                            actual: parameters.len(),
+                        });
+                    }
+                };
+                let source = build_expression_evaluator(source, context)?;
+                let starting_loc = build_expression_evaluator(starting_loc, context)?;
+                let length = length
                     .map(|l| build_expression_evaluator(l, context))
                     .transpose()?;
-                Rc::new(move |tuple| {
-                    let (source, language) = to_string_and_language(source(tuple)?)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (source, language) =
+                        try_or_ok!(to_string_and_language(try_or_ok!(source(tuple)?)));
 
-                    let starting_location: usize =
-                        if let ExpressionTerm::IntegerLiteral(v) = starting_loc(tuple)? {
-                            usize::try_from(i64::from(v)).ok()?
-                        } else {
-                            return None;
-                        };
+                    let starting_location: usize = if let ExpressionTerm::IntegerLiteral(v) =
+                        try_or_ok!(starting_loc(tuple)?)
+                    {
+                        try_or_ok!(usize::try_from(i64::from(v)).ok())
+                    } else {
+                        return Ok(None);
+                    };
                     let length = if let Some(length) = &length {
-                        if let ExpressionTerm::IntegerLiteral(v) = length(tuple)? {
-                            Some(usize::try_from(i64::from(v)).ok()?)
+                        if let ExpressionTerm::IntegerLiteral(v) = try_or_ok!(length(tuple)?) {
+                            Some(try_or_ok!(usize::try_from(i64::from(v)).ok()))
                         } else {
-                            return None;
+                            return Ok(None);
                         }
                     } else {
                         None
@@ -742,7 +991,7 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                     // We want to slice on char indices, not byte indices
                     let mut start_iter = source
                         .char_indices()
-                        .skip(starting_location.checked_sub(1)?)
+                        .skip(try_or_ok!(starting_location.checked_sub(1)))
                         .peekable();
                     let result = if let Some((start_position, _)) = start_iter.peek().copied() {
                         OxString::new_owned(if let Some(length) = length {
@@ -758,109 +1007,132 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                     } else {
                         OxString::default()
                     };
-                    Some(build_plain_literal(result, language))
-                })
+                    Ok(Some(build_plain_literal(result, language)))
+                }));
             }
-            Function::StrLen => {
-                let arg = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    let (string, _) = to_string_and_language(arg(tuple)?)?;
-                    Some(ExpressionTerm::IntegerLiteral(
-                        i64::try_from(string.chars().count()).ok()?.into(),
-                    ))
-                })
+            if *function == sparql::STRLEN {
+                let [p] = extract_parameters(function, parameters)?;
+                let arg = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (string, _) = try_or_ok!(to_string_and_language(try_or_ok!(arg(tuple)?)));
+                    Ok(Some(ExpressionTerm::IntegerLiteral(
+                        try_or_ok!(i64::try_from(string.chars().count()).ok()).into(),
+                    )))
+                }));
             }
-            Function::Replace => {
-                let arg = build_expression_evaluator(&parameters[0], context)?;
-                let replacement = build_expression_evaluator(&parameters[2], context)?;
-                if let Some(regex) =
-                    compile_static_pattern_if_exists(&parameters[1], parameters.get(3))
-                {
-                    Rc::new(move |tuple| {
-                        let (text, language) = to_string_and_language(arg(tuple)?)?;
-                        let ExpressionTerm::StringLiteral(replacement) = replacement(tuple)? else {
-                            return None;
+            if *function == sparql::REPLACE {
+                let (arg, pattern, replacement, flags) = match parameters.as_slice() {
+                    [arg, pattern, replacement] => (arg, pattern, replacement, None),
+                    [arg, pattern, replacement, flags] => (arg, pattern, replacement, Some(flags)),
+                    _ => {
+                        return Err(ExpressionEvaluationError::UnsupportedFunctionArity {
+                            name: function.clone(),
+                            expected: 3..=4,
+                            actual: parameters.len(),
+                        });
+                    }
+                };
+                let arg = build_expression_evaluator(arg, context)?;
+                let replacement = build_expression_evaluator(replacement, context)?;
+                if let Some(regex) = compile_static_pattern_if_exists(pattern, flags) {
+                    return Ok(Rc::new(move |tuple| {
+                        let (text, language) =
+                            try_or_ok!(to_string_and_language(try_or_ok!(arg(tuple)?)));
+                        let ExpressionTerm::StringLiteral(replacement) =
+                            try_or_ok!(replacement(tuple)?)
+                        else {
+                            return Ok(None);
                         };
-                        Some(build_plain_literal(
+                        Ok(Some(build_plain_literal(
                             match regex.replace_all(text.as_str(), replacement.as_str()) {
                                 Cow::Owned(replaced) => OxString::new_owned(&replaced),
                                 Cow::Borrowed(_) => text,
                             },
                             language,
-                        ))
-                    })
-                } else {
-                    let pattern = build_expression_evaluator(&parameters[1], context)?;
-                    let flags = parameters
-                        .get(3)
-                        .map(|flags| build_expression_evaluator(flags, context))
-                        .transpose()?;
-                    Rc::new(move |tuple| {
-                        let ExpressionTerm::StringLiteral(pattern) = pattern(tuple)? else {
-                            return None;
-                        };
-                        let options = if let Some(flags) = &flags {
-                            let ExpressionTerm::StringLiteral(options) = flags(tuple)? else {
-                                return None;
-                            };
-                            Some(options)
-                        } else {
-                            None
-                        };
-                        let regex = compile_pattern(&pattern, options.as_deref())?;
-                        let (text, language) = to_string_and_language(arg(tuple)?)?;
-                        let ExpressionTerm::StringLiteral(replacement) = replacement(tuple)? else {
-                            return None;
-                        };
-                        Some(build_plain_literal(
-                            match regex.replace_all(text.as_str(), replacement.as_str()) {
-                                Cow::Owned(replaced) => OxString::new_owned(&replaced),
-                                Cow::Borrowed(_) => text,
-                            },
-                            language,
-                        ))
-                    })
+                        )))
+                    }));
                 }
+                let pattern = build_expression_evaluator(pattern, context)?;
+                let flags = flags
+                    .map(|flags| build_expression_evaluator(flags, context))
+                    .transpose()?;
+                return Ok(Rc::new(move |tuple| {
+                    let ExpressionTerm::StringLiteral(pattern) = try_or_ok!(pattern(tuple)?) else {
+                        return Ok(None);
+                    };
+                    let options = if let Some(flags) = &flags {
+                        let ExpressionTerm::StringLiteral(options) = try_or_ok!(flags(tuple)?)
+                        else {
+                            return Ok(None);
+                        };
+                        Some(options)
+                    } else {
+                        None
+                    };
+                    let regex = try_or_ok!(compile_pattern(&pattern, options.as_deref()));
+                    let (text, language) =
+                        try_or_ok!(to_string_and_language(try_or_ok!(arg(tuple)?)));
+                    let ExpressionTerm::StringLiteral(replacement) =
+                        try_or_ok!(replacement(tuple)?)
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some(build_plain_literal(
+                        match regex.replace_all(text.as_str(), replacement.as_str()) {
+                            Cow::Owned(replaced) => OxString::new_owned(&replaced),
+                            Cow::Borrowed(_) => text,
+                        },
+                        language,
+                    )))
+                }));
             }
-            Function::UCase => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    let (mut value, language) = to_string_and_language(e(tuple)?)?;
+            if *function == sparql::UCASE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (mut value, language) =
+                        try_or_ok!(to_string_and_language(try_or_ok!(e(tuple)?)));
                     let value = if value.is_ascii() {
                         value.make_mut().make_ascii_uppercase();
                         value
                     } else {
                         OxString::new_owned(&value.to_uppercase())
                     };
-                    Some(build_plain_literal(value, language))
-                })
+                    Ok(Some(build_plain_literal(value, language)))
+                }));
             }
-            Function::LCase => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    let (mut value, language) = to_string_and_language(e(tuple)?)?;
+            if *function == sparql::LCASE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (mut value, language) =
+                        try_or_ok!(to_string_and_language(try_or_ok!(e(tuple)?)));
                     let value = if value.is_ascii() {
                         value.make_mut().make_ascii_lowercase();
                         value
                     } else {
                         OxString::new_owned(&value.to_lowercase())
                     };
-                    Some(build_plain_literal(value, language))
-                })
+                    Ok(Some(build_plain_literal(value, language)))
+                }));
             }
-            Function::StrStarts => {
-                let arg1 = build_expression_evaluator(&parameters[0], context)?;
-                let arg2 = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let (arg1, arg2, _) =
-                        to_argument_compatible_strings(arg1(tuple)?, arg2(tuple)?)?;
-                    Some(arg1.starts_with(arg2.as_str()).into())
-                })
+            if *function == sparql::STRSTARTS {
+                let [arg1, arg2] = extract_parameters(function, parameters)?;
+                let arg1 = build_expression_evaluator(arg1, context)?;
+                let arg2 = build_expression_evaluator(arg2, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (arg1, arg2, _) = try_or_ok!(to_argument_compatible_strings(
+                        try_or_ok!(arg1(tuple)?),
+                        try_or_ok!(arg2(tuple)?),
+                    ));
+                    Ok(Some(arg1.starts_with(arg2.as_str()).into()))
+                }));
             }
-            Function::EncodeForUri => {
-                let ltrl = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    let (ltlr, _) = to_string_and_language(ltrl(tuple)?)?;
+            if *function == sparql::ENCODE_FOR_URI {
+                let [p] = extract_parameters(function, parameters)?;
+                let ltrl = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (ltlr, _) = try_or_ok!(to_string_and_language(try_or_ok!(ltrl(tuple)?)));
                     let mut result = Vec::with_capacity(ltlr.len());
                     for c in ltlr.bytes() {
                         match c {
@@ -884,63 +1156,76 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                             }
                         }
                     }
-                    Some(ExpressionTerm::StringLiteral(OxString::new_owned(
-                        str::from_utf8(&result).ok()?,
-                    )))
-                })
+                    Ok(Some(ExpressionTerm::StringLiteral(OxString::new_owned(
+                        try_or_ok!(str::from_utf8(&result).ok()),
+                    ))))
+                }));
             }
-            Function::StrEnds => {
-                let arg1 = build_expression_evaluator(&parameters[0], context)?;
-                let arg2 = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let (arg1, arg2, _) =
-                        to_argument_compatible_strings(arg1(tuple)?, arg2(tuple)?)?;
-                    Some(arg1.ends_with(arg2.as_str()).into())
-                })
+            if *function == sparql::STRENDS {
+                let [arg1, arg2] = extract_parameters(function, parameters)?;
+                let arg1 = build_expression_evaluator(arg1, context)?;
+                let arg2 = build_expression_evaluator(arg2, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (arg1, arg2, _) = try_or_ok!(to_argument_compatible_strings(
+                        try_or_ok!(arg1(tuple)?),
+                        try_or_ok!(arg2(tuple)?),
+                    ));
+                    Ok(Some(arg1.ends_with(arg2.as_str()).into()))
+                }));
             }
-            Function::Contains => {
-                let arg1 = build_expression_evaluator(&parameters[0], context)?;
-                let arg2 = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let (arg1, arg2, _) =
-                        to_argument_compatible_strings(arg1(tuple)?, arg2(tuple)?)?;
-                    Some(arg1.contains(arg2.as_str()).into())
-                })
+            if *function == sparql::CONTAINS {
+                let [arg1, arg2] = extract_parameters(function, parameters)?;
+                let arg1 = build_expression_evaluator(arg1, context)?;
+                let arg2 = build_expression_evaluator(arg2, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (arg1, arg2, _) = try_or_ok!(to_argument_compatible_strings(
+                        try_or_ok!(arg1(tuple)?),
+                        try_or_ok!(arg2(tuple)?),
+                    ));
+                    Ok(Some(arg1.contains(arg2.as_str()).into()))
+                }));
             }
-            Function::StrBefore => {
-                let arg1 = build_expression_evaluator(&parameters[0], context)?;
-                let arg2 = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let (arg1, arg2, language) =
-                        to_argument_compatible_strings(arg1(tuple)?, arg2(tuple)?)?;
-                    Some(if let Some(position) = arg1.find(arg2.as_str()) {
+            if *function == sparql::STRBEFORE {
+                let [arg1, arg2] = extract_parameters(function, parameters)?;
+                let arg1 = build_expression_evaluator(arg1, context)?;
+                let arg2 = build_expression_evaluator(arg2, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (arg1, arg2, language) = try_or_ok!(to_argument_compatible_strings(
+                        try_or_ok!(arg1(tuple)?),
+                        try_or_ok!(arg2(tuple)?),
+                    ));
+                    Ok(Some(if let Some(position) = arg1.find(arg2.as_str()) {
                         build_plain_literal(OxString::new_owned(&arg1[..position]), language)
                     } else {
                         ExpressionTerm::StringLiteral(OxString::default())
-                    })
-                })
+                    }))
+                }));
             }
-            Function::StrAfter => {
-                let arg1 = build_expression_evaluator(&parameters[0], context)?;
-                let arg2 = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let (arg1, arg2, language) =
-                        to_argument_compatible_strings(arg1(tuple)?, arg2(tuple)?)?;
-                    Some(if let Some(position) = arg1.find(arg2.as_str()) {
+            if *function == sparql::STRAFTER {
+                let [arg1, arg2] = extract_parameters(function, parameters)?;
+                let arg1 = build_expression_evaluator(arg1, context)?;
+                let arg2 = build_expression_evaluator(arg2, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let (arg1, arg2, language) = try_or_ok!(to_argument_compatible_strings(
+                        try_or_ok!(arg1(tuple)?),
+                        try_or_ok!(arg2(tuple)?),
+                    ));
+                    Ok(Some(if let Some(position) = arg1.find(arg2.as_str()) {
                         build_plain_literal(
                             OxString::new_owned(&arg1[position + arg2.len()..]),
                             language,
                         )
                     } else {
                         ExpressionTerm::StringLiteral(OxString::default())
-                    })
-                })
+                    }))
+                }));
             }
-            Function::Year => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::IntegerLiteral(
-                        match e(tuple)? {
+            if *function == sparql::YEAR {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::IntegerLiteral(
+                        match try_or_ok!(e(tuple)?) {
                             ExpressionTerm::DateTimeLiteral(date_time) => date_time.year(),
                             #[cfg(feature = "sep-0002")]
                             ExpressionTerm::DateLiteral(date) => date.year(),
@@ -948,17 +1233,18 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                             ExpressionTerm::GYearMonthLiteral(year_month) => year_month.year(),
                             #[cfg(feature = "calendar-ext")]
                             ExpressionTerm::GYearLiteral(year) => year.year(),
-                            _ => return None,
+                            _ => return Ok(None),
                         }
                         .into(),
-                    ))
-                })
+                    )))
+                }));
             }
-            Function::Month => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::IntegerLiteral(
-                        match e(tuple)? {
+            if *function == sparql::MONTH {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::IntegerLiteral(
+                        match try_or_ok!(e(tuple)?) {
                             ExpressionTerm::DateTimeLiteral(date_time) => date_time.month(),
                             #[cfg(feature = "sep-0002")]
                             ExpressionTerm::DateLiteral(date) => date.month(),
@@ -968,17 +1254,18 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                             ExpressionTerm::GMonthDayLiteral(month_day) => month_day.month(),
                             #[cfg(feature = "calendar-ext")]
                             ExpressionTerm::GMonthLiteral(month) => month.month(),
-                            _ => return None,
+                            _ => return Ok(None),
                         }
                         .into(),
-                    ))
-                })
+                    )))
+                }));
             }
-            Function::Day => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::IntegerLiteral(
-                        match e(tuple)? {
+            if *function == sparql::DAY {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::IntegerLiteral(
+                        match try_or_ok!(e(tuple)?) {
                             ExpressionTerm::DateTimeLiteral(date_time) => date_time.day(),
                             #[cfg(feature = "sep-0002")]
                             ExpressionTerm::DateLiteral(date) => date.day(),
@@ -986,62 +1273,70 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                             ExpressionTerm::GMonthDayLiteral(month_day) => month_day.day(),
                             #[cfg(feature = "calendar-ext")]
                             ExpressionTerm::GDayLiteral(day) => day.day(),
-                            _ => return None,
+                            _ => return Ok(None),
                         }
                         .into(),
-                    ))
-                })
+                    )))
+                }));
             }
-            Function::Hours => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::IntegerLiteral(
-                        match e(tuple)? {
+            if *function == sparql::HOURS {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::IntegerLiteral(
+                        match try_or_ok!(e(tuple)?) {
                             ExpressionTerm::DateTimeLiteral(date_time) => date_time.hour(),
                             #[cfg(feature = "sep-0002")]
                             ExpressionTerm::TimeLiteral(time) => time.hour(),
-                            _ => return None,
+                            _ => return Ok(None),
                         }
                         .into(),
-                    ))
-                })
+                    )))
+                }));
             }
-            Function::Minutes => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::IntegerLiteral(
-                        match e(tuple)? {
+            if *function == sparql::MINUTES {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::IntegerLiteral(
+                        match try_or_ok!(e(tuple)?) {
                             ExpressionTerm::DateTimeLiteral(date_time) => date_time.minute(),
                             #[cfg(feature = "sep-0002")]
                             ExpressionTerm::TimeLiteral(time) => time.minute(),
-                            _ => return None,
+                            _ => return Ok(None),
                         }
                         .into(),
-                    ))
-                })
+                    )))
+                }));
             }
-            Function::Seconds => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTerm::DecimalLiteral(match e(tuple)? {
-                        ExpressionTerm::DateTimeLiteral(date_time) => date_time.second(),
-                        #[cfg(feature = "sep-0002")]
-                        ExpressionTerm::TimeLiteral(time) => time.second(),
-                        _ => return None,
-                    }))
-                })
+            if *function == sparql::SECONDS {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(ExpressionTerm::DecimalLiteral(
+                        match try_or_ok!(e(tuple)?) {
+                            ExpressionTerm::DateTimeLiteral(date_time) => date_time.second(),
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::TimeLiteral(time) => time.second(),
+                            _ => return Ok(None),
+                        },
+                    )))
+                }));
             }
-            Function::Timezone => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    let result = match e(tuple)? {
+            if *function == sparql::TIMEZONE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let result = try_or_ok!(match try_or_ok!(e(tuple)?) {
                         ExpressionTerm::DateTimeLiteral(date_time) => date_time.timezone(),
                         #[cfg(feature = "sep-0002")]
                         ExpressionTerm::TimeLiteral(time) => time.timezone(),
                         #[cfg(feature = "sep-0002")]
                         ExpressionTerm::DateLiteral(date) => date.timezone(),
                         #[cfg(feature = "calendar-ext")]
-                        ExpressionTerm::GYearMonthLiteral(year_month) => year_month.timezone(),
+                        ExpressionTerm::GYearMonthLiteral(year_month) => {
+                            year_month.timezone()
+                        }
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GYearLiteral(year) => year.timezone(),
                         #[cfg(feature = "calendar-ext")]
@@ -1051,24 +1346,25 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GMonthLiteral(month) => month.timezone(),
                         _ => None,
-                    }?;
+                    });
                     #[cfg(feature = "sep-0002")]
                     {
-                        Some(ExpressionTerm::DayTimeDurationLiteral(result))
+                        Ok(Some(ExpressionTerm::DayTimeDurationLiteral(result)))
                     }
                     #[cfg(not(feature = "sep-0002"))]
                     {
-                        Some(ExpressionTerm::OtherTypedLiteral {
+                        Ok(Some(ExpressionTerm::OtherTypedLiteral {
                             value: OxString::new_owned(&result.to_string()),
                             datatype: xsd::DAY_TIME_DURATION,
-                        })
+                        }))
                     }
-                })
+                }));
             }
-            Function::Tz => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    let timezone_offset = match e(tuple)? {
+            if *function == sparql::TZ {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let timezone_offset = match try_or_ok!(e(tuple)?) {
                         ExpressionTerm::DateTimeLiteral(date_time) => date_time.timezone_offset(),
                         #[cfg(feature = "sep-0002")]
                         ExpressionTerm::TimeLiteral(time) => time.timezone_offset(),
@@ -1086,499 +1382,719 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                         ExpressionTerm::GDayLiteral(day) => day.timezone_offset(),
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GMonthLiteral(month) => month.timezone_offset(),
-                        _ => return None,
+                        _ => return Ok(None),
                     };
-                    Some(ExpressionTerm::StringLiteral(
+                    Ok(Some(ExpressionTerm::StringLiteral(
                         timezone_offset.map_or_else(OxString::default, |o| {
                             OxString::new_owned(o.to_string().as_str())
                         }),
-                    ))
-                })
+                    )))
+                }));
             }
             #[cfg(feature = "sep-0002")]
-            Function::Adjust => {
-                let dt = build_expression_evaluator(&parameters[0], context)?;
-                let tz = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let timezone_offset = Some(
-                        match tz(tuple)? {
+            if *function == sparql::ADJUST {
+                let [dt, tz] = extract_parameters(function, parameters)?;
+                let dt = build_expression_evaluator(dt, context)?;
+                let tz = build_expression_evaluator(tz, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let timezone_offset = Some(try_or_ok!(
+                        match try_or_ok!(tz(tuple)?) {
                             ExpressionTerm::DayTimeDurationLiteral(tz) => {
                                 TimezoneOffset::try_from(tz)
                             }
-                            ExpressionTerm::DurationLiteral(tz) => TimezoneOffset::try_from(tz),
-                            _ => return None,
+                            ExpressionTerm::DurationLiteral(tz) => {
+                                TimezoneOffset::try_from(tz)
+                            }
+                            _ => return Ok(None),
                         }
-                        .ok()?,
-                    );
-                    Some(match dt(tuple)? {
+                        .ok()
+                    ));
+                    Ok(Some(match try_or_ok!(dt(tuple)?) {
                         ExpressionTerm::DateTimeLiteral(date_time) => {
-                            ExpressionTerm::DateTimeLiteral(date_time.adjust(timezone_offset)?)
+                            ExpressionTerm::DateTimeLiteral(try_or_ok!(
+                                date_time.adjust(timezone_offset)
+                            ))
                         }
                         ExpressionTerm::TimeLiteral(time) => {
-                            ExpressionTerm::TimeLiteral(time.adjust(timezone_offset)?)
+                            ExpressionTerm::TimeLiteral(try_or_ok!(time.adjust(timezone_offset)))
                         }
                         ExpressionTerm::DateLiteral(date) => {
-                            ExpressionTerm::DateLiteral(date.adjust(timezone_offset)?)
+                            ExpressionTerm::DateLiteral(try_or_ok!(date.adjust(timezone_offset)))
                         }
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GYearMonthLiteral(year_month) => {
-                            ExpressionTerm::GYearMonthLiteral(year_month.adjust(timezone_offset)?)
+                            ExpressionTerm::GYearMonthLiteral(try_or_ok!(
+                                year_month.adjust(timezone_offset)
+                            ))
                         }
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GYearLiteral(year) => {
-                            ExpressionTerm::GYearLiteral(year.adjust(timezone_offset)?)
+                            ExpressionTerm::GYearLiteral(try_or_ok!(year.adjust(timezone_offset)))
                         }
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GMonthDayLiteral(month_day) => {
-                            ExpressionTerm::GMonthDayLiteral(month_day.adjust(timezone_offset)?)
+                            ExpressionTerm::GMonthDayLiteral(try_or_ok!(
+                                month_day.adjust(timezone_offset)
+                            ))
                         }
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GDayLiteral(day) => {
-                            ExpressionTerm::GDayLiteral(day.adjust(timezone_offset)?)
+                            ExpressionTerm::GDayLiteral(try_or_ok!(day.adjust(timezone_offset)))
                         }
                         #[cfg(feature = "calendar-ext")]
                         ExpressionTerm::GMonthLiteral(month) => {
-                            ExpressionTerm::GMonthLiteral(month.adjust(timezone_offset)?)
+                            ExpressionTerm::GMonthLiteral(try_or_ok!(month.adjust(timezone_offset)))
                         }
-                        _ => return None,
-                    })
-                })
+                        _ => return Ok(None),
+                    }))
+                }));
             }
-            Function::Now => {
+            if *function == sparql::NOW {
                 let now = context.now();
-                Rc::new(move |_| Some(ExpressionTerm::DateTimeLiteral(now)))
+                return Ok(Rc::new(move |_| {
+                    Ok(Some(ExpressionTerm::DateTimeLiteral(now)))
+                }));
             }
-            Function::Uuid => Rc::new(move |_| {
-                let mut buffer = String::with_capacity(44);
-                buffer.push_str("urn:uuid:");
-                generate_uuid(&mut buffer);
-                Some(ExpressionTerm::NamedNode(NamedNode::new_unchecked(
-                    OxString::new_owned(&buffer),
-                )))
-            }),
-            Function::StrUuid => Rc::new(move |_| {
-                let mut buffer = String::with_capacity(36);
-                generate_uuid(&mut buffer);
-                Some(ExpressionTerm::StringLiteral(OxString::new_owned(&buffer)))
-            }),
-            Function::Md5 => build_hash_expression_evaluator::<_, Md5>(parameters, context)?,
-            Function::Sha1 => build_hash_expression_evaluator::<_, Sha1>(parameters, context)?,
-            Function::Sha256 => build_hash_expression_evaluator::<_, Sha256>(parameters, context)?,
-            Function::Sha384 => build_hash_expression_evaluator::<_, Sha384>(parameters, context)?,
-            Function::Sha512 => build_hash_expression_evaluator::<_, Sha512>(parameters, context)?,
-            Function::StrLang => {
-                let lexical_form = build_expression_evaluator(&parameters[0], context)?;
-                let lang_tag = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let ExpressionTerm::StringLiteral(value) = lexical_form(tuple)? else {
-                        return None;
+            if *function == sparql::UUID {
+                return Ok(Rc::new(move |_| {
+                    let mut buffer = String::with_capacity(44);
+                    buffer.push_str("urn:uuid:");
+                    generate_uuid(&mut buffer);
+                    Ok(Some(ExpressionTerm::NamedNode(NamedNode::new_unchecked(
+                        OxString::new_owned(&buffer),
+                    ))))
+                }));
+            }
+            if *function == sparql::STRUUID {
+                return Ok(Rc::new(move |_| {
+                    let mut buffer = String::with_capacity(36);
+                    generate_uuid(&mut buffer);
+                    Ok(Some(ExpressionTerm::StringLiteral(OxString::new_owned(
+                        &buffer,
+                    ))))
+                }));
+            }
+            if *function == sparql::MD5 {
+                return build_hash_expression_evaluator::<_, Md5>(function, parameters, context);
+            }
+            if *function == sparql::SHA1 {
+                return build_hash_expression_evaluator::<_, Sha1>(function, parameters, context);
+            }
+            if *function == sparql::SHA256 {
+                return build_hash_expression_evaluator::<_, Sha256>(function, parameters, context);
+            }
+            if *function == sparql::SHA384 {
+                return build_hash_expression_evaluator::<_, Sha384>(function, parameters, context);
+            }
+            if *function == sparql::SHA512 {
+                return build_hash_expression_evaluator::<_, Sha512>(function, parameters, context);
+            }
+            if *function == sparql::STRLANG {
+                let [lexical_form, lang_tag] = extract_parameters(function, parameters)?;
+                let lexical_form = build_expression_evaluator(lexical_form, context)?;
+                let lang_tag = build_expression_evaluator(lang_tag, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let ExpressionTerm::StringLiteral(value) = try_or_ok!(lexical_form(tuple)?)
+                    else {
+                        return Ok(None);
                     };
-                    let ExpressionTerm::StringLiteral(language) = lang_tag(tuple)? else {
-                        return None;
+                    let ExpressionTerm::StringLiteral(language) = try_or_ok!(lang_tag(tuple)?)
+                    else {
+                        return Ok(None);
                     };
-                    Some(
-                        Term::from(Literal::new_language_tagged_literal(value, language).ok()?)
-                            .into(),
-                    )
-                })
+                    Ok(Some(
+                        Term::from(try_or_ok!(
+                            Literal::new_language_tagged_literal(value, language).ok()
+                        ))
+                        .into(),
+                    ))
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::StrLangDir => {
-                let lexical_form = build_expression_evaluator(&parameters[0], context)?;
-                let lang_tag = build_expression_evaluator(&parameters[1], context)?;
-                let direction = build_expression_evaluator(&parameters[2], context)?;
-                Rc::new(move |tuple| {
-                    let ExpressionTerm::StringLiteral(value) = lexical_form(tuple)? else {
-                        return None;
+            if *function == sparql::STRLANGDIR {
+                let [lexical_form, lang_tag, direction] = extract_parameters(function, parameters)?;
+                let lexical_form = build_expression_evaluator(lexical_form, context)?;
+                let lang_tag = build_expression_evaluator(lang_tag, context)?;
+                let direction = build_expression_evaluator(direction, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let ExpressionTerm::StringLiteral(value) = try_or_ok!(lexical_form(tuple)?)
+                    else {
+                        return Ok(None);
                     };
-                    let ExpressionTerm::StringLiteral(language) = lang_tag(tuple)? else {
-                        return None;
+                    let ExpressionTerm::StringLiteral(language) = try_or_ok!(lang_tag(tuple)?)
+                    else {
+                        return Ok(None);
                     };
-                    let ExpressionTerm::StringLiteral(direction) = direction(tuple)? else {
-                        return None;
+                    let ExpressionTerm::StringLiteral(direction) = try_or_ok!(direction(tuple)?)
+                    else {
+                        return Ok(None);
                     };
                     let direction = match direction.as_str() {
                         "ltr" => BaseDirection::Ltr,
                         "rtl" => BaseDirection::Rtl,
-                        _ => return None,
+                        _ => return Ok(None),
                     };
-                    Some(
-                        Term::from(
+                    Ok(Some(
+                        Term::from(try_or_ok!(
                             Literal::new_directional_language_tagged_literal(
                                 value, language, direction,
                             )
-                            .ok()?,
-                        )
+                            .ok()
+                        ))
                         .into(),
-                    )
-                })
+                    ))
+                }));
             }
-            Function::StrDt => {
-                let lexical_form = build_expression_evaluator(&parameters[0], context)?;
-                let datatype = build_expression_evaluator(&parameters[1], context)?;
-                Rc::new(move |tuple| {
-                    let ExpressionTerm::StringLiteral(value) = lexical_form(tuple)? else {
-                        return None;
+            if *function == sparql::STRDT {
+                let [lexical_form, datatype] = extract_parameters(function, parameters)?;
+                let lexical_form = build_expression_evaluator(lexical_form, context)?;
+                let datatype = build_expression_evaluator(datatype, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    let ExpressionTerm::StringLiteral(value) = try_or_ok!(lexical_form(tuple)?)
+                    else {
+                        return Ok(None);
                     };
-                    let ExpressionTerm::NamedNode(datatype) = datatype(tuple)? else {
-                        return None;
+                    let ExpressionTerm::NamedNode(datatype) = try_or_ok!(datatype(tuple)?) else {
+                        return Ok(None);
                     };
-                    Some(Term::from(Literal::new_typed_literal(value, datatype)).into())
-                })
+                    Ok(Some(
+                        Term::from(Literal::new_typed_literal(value, datatype)).into(),
+                    ))
+                }));
             }
-
-            Function::IsIri => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| Some(matches!(e(tuple)?, ExpressionTerm::NamedNode(_)).into()))
+            if *function == sparql::IS_IRI || *function == sparql::IS_URI {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        matches!(try_or_ok!(e(tuple)?), ExpressionTerm::NamedNode(_)).into(),
+                    ))
+                }));
             }
-            Function::IsBlank => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| Some(matches!(e(tuple)?, ExpressionTerm::BlankNode(_)).into()))
+            if *function == sparql::IS_BLANK {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        matches!(try_or_ok!(e(tuple)?), ExpressionTerm::BlankNode(_)).into(),
+                    ))
+                }));
             }
-            Function::IsLiteral => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(
-                        match e(tuple)? {
+            if *function == sparql::IS_LITERAL {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        match try_or_ok!(e(tuple)?) {
                             ExpressionTerm::NamedNode(_) | ExpressionTerm::BlankNode(_) => false,
                             #[cfg(feature = "sparql-12")]
                             ExpressionTerm::Triple(_) => false,
                             _ => true,
                         }
                         .into(),
-                    )
-                })
+                    ))
+                }));
             }
-            Function::IsNumeric => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(
+            if *function == sparql::IS_NUMERIC {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
                         matches!(
-                            e(tuple)?,
+                            try_or_ok!(e(tuple)?),
                             ExpressionTerm::IntegerLiteral(_)
                                 | ExpressionTerm::DecimalLiteral(_)
                                 | ExpressionTerm::FloatLiteral(_)
                                 | ExpressionTerm::DoubleLiteral(_)
                         )
                         .into(),
-                    )
-                })
+                    ))
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::HasLang => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(
+            if *function == sparql::HAS_LANG {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
                         matches!(
-                            e(tuple)?,
+                            try_or_ok!(e(tuple)?),
                             ExpressionTerm::LangStringLiteral { .. }
                                 | ExpressionTerm::DirLangStringLiteral { .. }
                         )
                         .into(),
-                    )
-                })
+                    ))
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::HasLangDir => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    Some(matches!(e(tuple)?, ExpressionTerm::DirLangStringLiteral { .. }).into())
-                })
+            if *function == sparql::HAS_LANGDIR {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        matches!(
+                            try_or_ok!(e(tuple)?),
+                            ExpressionTerm::DirLangStringLiteral { .. }
+                        )
+                        .into(),
+                    ))
+                }));
             }
-            Function::Regex => {
-                let text = build_expression_evaluator(&parameters[0], context)?;
-                if let Some(regex) =
-                    compile_static_pattern_if_exists(&parameters[1], parameters.get(2))
-                {
-                    Rc::new(move |tuple| {
-                        let (text, _) = to_string_and_language(text(tuple)?)?;
-                        Some(regex.is_match(&text).into())
-                    })
-                } else {
-                    let pattern = build_expression_evaluator(&parameters[1], context)?;
-                    let flags = parameters
-                        .get(2)
-                        .map(|flags| build_expression_evaluator(flags, context))
-                        .transpose()?;
-                    Rc::new(move |tuple| {
-                        let ExpressionTerm::StringLiteral(pattern) = pattern(tuple)? else {
-                            return None;
-                        };
-                        let options = if let Some(flags) = &flags {
-                            let ExpressionTerm::StringLiteral(options) = flags(tuple)? else {
-                                return None;
-                            };
-                            Some(options)
-                        } else {
-                            None
-                        };
-                        let regex = compile_pattern(&pattern, options.as_deref())?;
-                        let (text, _) = to_string_and_language(text(tuple)?)?;
-                        Some(regex.is_match(&text).into())
-                    })
+            if *function == sparql::REGEX {
+                let (text, pattern, flags) = match parameters.as_slice() {
+                    [text, pattern] => (text, pattern, None),
+                    [text, pattern, flags] => (text, pattern, Some(flags)),
+                    _ => {
+                        return Err(ExpressionEvaluationError::UnsupportedFunctionArity {
+                            name: function.clone(),
+                            expected: 2..=3,
+                            actual: parameters.len(),
+                        });
+                    }
+                };
+                let text = build_expression_evaluator(text, context)?;
+                if let Some(regex) = compile_static_pattern_if_exists(pattern, flags) {
+                    return Ok(Rc::new(move |tuple| {
+                        let (text, _) =
+                            try_or_ok!(to_string_and_language(try_or_ok!(text(tuple)?)));
+                        Ok(Some(regex.is_match(&text).into()))
+                    }));
                 }
+                let pattern = build_expression_evaluator(pattern, context)?;
+                let flags = flags
+                    .map(|flags| build_expression_evaluator(flags, context))
+                    .transpose()?;
+                return Ok(Rc::new(move |tuple| {
+                    let ExpressionTerm::StringLiteral(pattern) = try_or_ok!(pattern(tuple)?) else {
+                        return Ok(None);
+                    };
+                    let options = if let Some(flags) = &flags {
+                        let ExpressionTerm::StringLiteral(options) = try_or_ok!(flags(tuple)?)
+                        else {
+                            return Ok(None);
+                        };
+                        Some(options)
+                    } else {
+                        None
+                    };
+                    let regex = try_or_ok!(compile_pattern(&pattern, options.as_deref()));
+                    let (text, _) = try_or_ok!(to_string_and_language(try_or_ok!(text(tuple)?)));
+                    Ok(Some(regex.is_match(&text).into()))
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::Triple => {
-                let s = build_expression_evaluator(&parameters[0], context)?;
-                let p = build_expression_evaluator(&parameters[1], context)?;
-                let o = build_expression_evaluator(&parameters[2], context)?;
-                Rc::new(move |tuple| {
-                    Some(ExpressionTriple::new(s(tuple)?, p(tuple)?, o(tuple)?)?.into())
-                })
+            if *function == sparql::TRIPLE {
+                let [s, p, o] = extract_parameters(function, parameters)?;
+                let s = build_expression_evaluator(s, context)?;
+                let p = build_expression_evaluator(p, context)?;
+                let o = build_expression_evaluator(o, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        try_or_ok!(ExpressionTriple::new(
+                            try_or_ok!(s(tuple)?),
+                            try_or_ok!(p(tuple)?),
+                            try_or_ok!(o(tuple)?),
+                        ))
+                        .into(),
+                    ))
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::Subject => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    if let ExpressionTerm::Triple(t) = e(tuple)? {
+            if *function == sparql::SUBJECT {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(if let ExpressionTerm::Triple(t) = try_or_ok!(e(tuple)?) {
                         Some(t.subject.into())
                     } else {
                         None
-                    }
-                })
+                    })
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::Predicate => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    if let ExpressionTerm::Triple(t) = e(tuple)? {
+            if *function == sparql::PREDICATE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(if let ExpressionTerm::Triple(t) = try_or_ok!(e(tuple)?) {
                         Some(t.predicate.into())
                     } else {
                         None
-                    }
-                })
+                    })
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::Object => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| {
-                    if let ExpressionTerm::Triple(t) = e(tuple)? {
+            if *function == sparql::OBJECT {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(if let ExpressionTerm::Triple(t) = try_or_ok!(e(tuple)?) {
                         Some(t.object)
                     } else {
                         None
-                    }
-                })
+                    })
+                }));
             }
             #[cfg(feature = "sparql-12")]
-            Function::IsTriple => {
-                let e = build_expression_evaluator(&parameters[0], context)?;
-                Rc::new(move |tuple| Some(matches!(e(tuple)?, ExpressionTerm::Triple(_)).into()))
+            if *function == sparql::IS_TRIPLE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok(Some(
+                        matches!(try_or_ok!(e(tuple)?), ExpressionTerm::Triple(_)).into(),
+                    ))
+                }));
             }
-            Function::Custom(function_name) => {
-                if let Some(function) = context.custom_functions().get(function_name).cloned() {
-                    let args = parameters
-                        .iter()
-                        .map(|e| build_expression_evaluator(e, context))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(Rc::new(move |tuple| {
-                        let args = args
-                            .iter()
-                            .map(|f| Some(f(tuple)?.into()))
-                            .collect::<Option<Vec<_>>>()?;
-                        Some(function(&args)?.into())
-                    }));
-                }
-
-                macro_rules! cast_fn {
-                    ($name:expr, $eval:expr) => {{
-                        if *function_name == $name {
-                            if parameters.len() != 1 {
-                                return Err(
-                                    ExpressionEvaluationError::UnsupportedCustomFunctionArity {
-                                        name: function_name.clone(),
-                                        expected: 1..=1,
-                                        actual: parameters.len(),
-                                    },
-                                );
+            if *function == xsd::STRING {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::StringLiteral(match t {
+                            ExpressionTerm::NamedNode(term) => term.into_string(),
+                            ExpressionTerm::BlankNode(_) => return None,
+                            ExpressionTerm::StringLiteral(value)
+                            | ExpressionTerm::LangStringLiteral { value, .. }
+                            | ExpressionTerm::OtherTypedLiteral { value, .. } => value,
+                            #[cfg(feature = "sparql-12")]
+                            ExpressionTerm::DirLangStringLiteral { value, .. } => value,
+                            ExpressionTerm::BooleanLiteral(value) => {
+                                Literal::from(value).into_value()
                             }
-                            let e = build_expression_evaluator(&parameters[0], context)?;
-                            return Ok(Rc::new(move |tuple| ($eval)(e(tuple)?)));
-                        }
-                    }};
-                }
-
-                cast_fn!(xsd::STRING, |t: ExpressionTerm| Some(
-                    ExpressionTerm::StringLiteral(match t.into() {
-                        Term::NamedNode(term) => term.into_string(),
-                        Term::BlankNode(_) => return None,
-                        Term::Literal(term) => term.into_value(),
-                        #[cfg(feature = "sparql-12")]
-                        Term::Triple(_) => return None,
-                    })
-                ));
-                cast_fn!(xsd::BOOLEAN, |t: ExpressionTerm| Some(
-                    ExpressionTerm::BooleanLiteral(match t {
-                        ExpressionTerm::BooleanLiteral(value) => value,
-                        ExpressionTerm::FloatLiteral(value) => value.into(),
-                        ExpressionTerm::DoubleLiteral(value) => value.into(),
-                        ExpressionTerm::IntegerLiteral(value) => value.into(),
-                        ExpressionTerm::DecimalLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                cast_fn!(xsd::DOUBLE, |t: ExpressionTerm| Some(
-                    ExpressionTerm::DoubleLiteral(match t {
-                        ExpressionTerm::FloatLiteral(value) => value.into(),
-                        ExpressionTerm::DoubleLiteral(value) => value,
-                        ExpressionTerm::IntegerLiteral(value) => value.into(),
-                        ExpressionTerm::DecimalLiteral(value) => value.into(),
-                        ExpressionTerm::BooleanLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                cast_fn!(xsd::FLOAT, |t: ExpressionTerm| Some(
-                    ExpressionTerm::FloatLiteral(match t {
-                        ExpressionTerm::FloatLiteral(value) => value,
-                        ExpressionTerm::DoubleLiteral(value) => value.into(),
-                        ExpressionTerm::IntegerLiteral(value) => value.into(),
-                        ExpressionTerm::DecimalLiteral(value) => value.into(),
-                        ExpressionTerm::BooleanLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-
-                cast_fn!(xsd::INTEGER, |t: ExpressionTerm| Some(
-                    ExpressionTerm::IntegerLiteral(match t {
-                        ExpressionTerm::FloatLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::DoubleLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::IntegerLiteral(value) => value,
-                        ExpressionTerm::DecimalLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::BooleanLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                cast_fn!(xsd::DECIMAL, |t: ExpressionTerm| Some(
-                    ExpressionTerm::DecimalLiteral(match t {
-                        ExpressionTerm::FloatLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::DoubleLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::IntegerLiteral(value) => value.into(),
-                        ExpressionTerm::DecimalLiteral(value) => value,
-                        ExpressionTerm::BooleanLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "sep-0002")]
-                cast_fn!(xsd::DATE, |t: ExpressionTerm| Some(
-                    ExpressionTerm::DateLiteral(match t {
-                        ExpressionTerm::DateLiteral(value) => value,
-                        ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "sep-0002")]
-                cast_fn!(xsd::TIME, |t: ExpressionTerm| Some(
-                    ExpressionTerm::TimeLiteral(match t {
-                        ExpressionTerm::TimeLiteral(value) => value,
-                        ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                cast_fn!(xsd::DATE_TIME, |t: ExpressionTerm| Some(
-                    ExpressionTerm::DateTimeLiteral(match t {
-                        ExpressionTerm::DateTimeLiteral(value) => value,
-                        #[cfg(feature = "sep-0002")]
-                        ExpressionTerm::DateLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "sep-0002")]
-                cast_fn!(xsd::DURATION, |t: ExpressionTerm| Some(
-                    ExpressionTerm::DurationLiteral(match t {
-                        ExpressionTerm::DurationLiteral(value) => value,
-                        ExpressionTerm::YearMonthDurationLiteral(value) => value.into(),
-                        ExpressionTerm::DayTimeDurationLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "sep-0002")]
-                cast_fn!(xsd::YEAR_MONTH_DURATION, |t: ExpressionTerm| Some(
-                    ExpressionTerm::YearMonthDurationLiteral(match t {
-                        ExpressionTerm::DurationLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::YearMonthDurationLiteral(value) => value,
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "sep-0002")]
-                cast_fn!(xsd::DAY_TIME_DURATION, |t: ExpressionTerm| Some(
-                    ExpressionTerm::DayTimeDurationLiteral(match t {
-                        ExpressionTerm::DurationLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::DayTimeDurationLiteral(value) => value,
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "calendar-ext")]
-                cast_fn!(xsd::G_YEAR, |t: ExpressionTerm| Some(
-                    ExpressionTerm::GYearLiteral(match t {
-                        ExpressionTerm::GYearLiteral(value) => value,
-                        ExpressionTerm::GYearMonthLiteral(value) => {
-                            value.try_into().ok()?
-                        }
-                        ExpressionTerm::DateLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "calendar-ext")]
-                cast_fn!(xsd::G_YEAR_MONTH, |t: ExpressionTerm| Some(
-                    ExpressionTerm::GYearMonthLiteral(match t {
-                        ExpressionTerm::GYearMonthLiteral(value) => value,
-                        ExpressionTerm::DateLiteral(value) => value.into(),
-                        ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "calendar-ext")]
-                cast_fn!(xsd::G_MONTH, |t: ExpressionTerm| Some(
-                    ExpressionTerm::GMonthLiteral(match t {
-                        ExpressionTerm::GMonthLiteral(value) => value,
-                        ExpressionTerm::GYearMonthLiteral(value) => value.into(),
-                        ExpressionTerm::GMonthDayLiteral(value) => value.into(),
-                        ExpressionTerm::DateLiteral(value) => value.into(),
-                        ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "calendar-ext")]
-                cast_fn!(xsd::G_MONTH_DAY, |t: ExpressionTerm| Some(
-                    ExpressionTerm::GMonthDayLiteral(match t {
-                        ExpressionTerm::GMonthDayLiteral(value) => value,
-                        ExpressionTerm::DateLiteral(value) => value.into(),
-                        ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                #[cfg(feature = "calendar-ext")]
-                cast_fn!(xsd::G_DAY, |t: ExpressionTerm| Some(
-                    ExpressionTerm::GDayLiteral(match t {
-                        ExpressionTerm::GDayLiteral(value) => value,
-                        ExpressionTerm::GMonthDayLiteral(value) => value.into(),
-                        ExpressionTerm::DateLiteral(value) => value.into(),
-                        ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                        ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
-                        _ => return None,
-                    })
-                ));
-                return Err(ExpressionEvaluationError::UnsupportedCustomFunction(
-                    function_name.clone(),
-                ));
+                            // TODO: avoid the intermediate allocation
+                            ExpressionTerm::IntegerLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            ExpressionTerm::DecimalLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            ExpressionTerm::FloatLiteral(value) => {
+                                if Float::from(0.000_001) <= value.abs()
+                                    && value.abs() < Float::from(1_000_000.)
+                                    || Float::from(-0.) <= value && value <= Float::from(0.)
+                                {
+                                    OxString::new_owned(&f32::from(value).to_string())
+                                } else {
+                                    Literal::from(value).into_value()
+                                }
+                            }
+                            ExpressionTerm::DoubleLiteral(value) => {
+                                if Double::from(0.000_001) <= value.abs()
+                                    && value.abs() < Double::from(1_000_000.)
+                                    || Double::from(-0.) <= value && value <= Double::from(0.)
+                                {
+                                    OxString::new_owned(&f64::from(value).to_string())
+                                } else {
+                                    Literal::from(value).into_value()
+                                }
+                            }
+                            ExpressionTerm::DateTimeLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::DateLiteral(value) => Literal::from(value).into_value(),
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::TimeLiteral(value) => Literal::from(value).into_value(),
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GYearLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GYearMonthLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GMonthLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GMonthDayLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "calendar-ext")]
+                            ExpressionTerm::GDayLiteral(value) => Literal::from(value).into_value(),
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::DurationLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::YearMonthDurationLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::DayTimeDurationLiteral(value) => {
+                                Literal::from(value).into_value()
+                            }
+                            #[cfg(feature = "sparql-12")]
+                            ExpressionTerm::Triple(_) => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
             }
-        },
+            if *function == xsd::BOOLEAN {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::BooleanLiteral(match t {
+                            ExpressionTerm::BooleanLiteral(value) => value,
+                            ExpressionTerm::FloatLiteral(value) => value.into(),
+                            ExpressionTerm::DoubleLiteral(value) => value.into(),
+                            ExpressionTerm::IntegerLiteral(value) => value.into(),
+                            ExpressionTerm::DecimalLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            if *function == xsd::DOUBLE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::DoubleLiteral(match t {
+                            ExpressionTerm::FloatLiteral(value) => value.into(),
+                            ExpressionTerm::DoubleLiteral(value) => value,
+                            ExpressionTerm::IntegerLiteral(value) => value.into(),
+                            ExpressionTerm::DecimalLiteral(value) => value.into(),
+                            ExpressionTerm::BooleanLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            if *function == xsd::FLOAT {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::FloatLiteral(match t {
+                            ExpressionTerm::FloatLiteral(value) => value,
+                            ExpressionTerm::DoubleLiteral(value) => value.into(),
+                            ExpressionTerm::IntegerLiteral(value) => value.into(),
+                            ExpressionTerm::DecimalLiteral(value) => value.into(),
+                            ExpressionTerm::BooleanLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            if *function == xsd::INTEGER {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::IntegerLiteral(match t {
+                            ExpressionTerm::FloatLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::DoubleLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::IntegerLiteral(value) => value,
+                            ExpressionTerm::DecimalLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::BooleanLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            if *function == xsd::DECIMAL {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::DecimalLiteral(match t {
+                            ExpressionTerm::FloatLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::DoubleLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::IntegerLiteral(value) => value.into(),
+                            ExpressionTerm::DecimalLiteral(value) => value,
+                            ExpressionTerm::BooleanLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "sep-0002")]
+            if *function == xsd::DATE {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::DateLiteral(match t {
+                            ExpressionTerm::DateLiteral(value) => value,
+                            ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "sep-0002")]
+            if *function == xsd::TIME {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::TimeLiteral(match t {
+                            ExpressionTerm::TimeLiteral(value) => value,
+                            ExpressionTerm::DateTimeLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            if *function == xsd::DATE_TIME {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::DateTimeLiteral(match t {
+                            ExpressionTerm::DateTimeLiteral(value) => value,
+                            #[cfg(feature = "sep-0002")]
+                            ExpressionTerm::DateLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "sep-0002")]
+            if *function == xsd::DURATION {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::DurationLiteral(match t {
+                            ExpressionTerm::DurationLiteral(value) => value,
+                            ExpressionTerm::YearMonthDurationLiteral(value) => value.into(),
+                            ExpressionTerm::DayTimeDurationLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "sep-0002")]
+            if *function == xsd::YEAR_MONTH_DURATION {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::YearMonthDurationLiteral(match t {
+                            ExpressionTerm::DurationLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::YearMonthDurationLiteral(value) => value,
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "sep-0002")]
+            if *function == xsd::DAY_TIME_DURATION {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::DayTimeDurationLiteral(match t {
+                            ExpressionTerm::DurationLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::DayTimeDurationLiteral(value) => value,
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "calendar-ext")]
+            if *function == xsd::G_YEAR {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::GYearLiteral(match t {
+                            ExpressionTerm::GYearLiteral(value) => value,
+                            ExpressionTerm::GYearMonthLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::DateLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "calendar-ext")]
+            if *function == xsd::G_YEAR_MONTH {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::GYearMonthLiteral(match t {
+                            ExpressionTerm::GYearMonthLiteral(value) => value,
+                            ExpressionTerm::DateLiteral(value) => value.into(),
+                            ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "calendar-ext")]
+            if *function == xsd::G_MONTH {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::GMonthLiteral(match t {
+                            ExpressionTerm::GMonthLiteral(value) => value,
+                            ExpressionTerm::GYearMonthLiteral(value) => value.into(),
+                            ExpressionTerm::GMonthDayLiteral(value) => value.into(),
+                            ExpressionTerm::DateLiteral(value) => value.into(),
+                            ExpressionTerm::DateTimeLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "calendar-ext")]
+            if *function == xsd::G_MONTH_DAY {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::GMonthDayLiteral(match t {
+                            ExpressionTerm::GMonthDayLiteral(value) => value,
+                            ExpressionTerm::DateLiteral(value) => value.into(),
+                            ExpressionTerm::DateTimeLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            #[cfg(feature = "calendar-ext")]
+            if *function == xsd::G_DAY {
+                let [p] = extract_parameters(function, parameters)?;
+                let e = build_expression_evaluator(p, context)?;
+                return Ok(Rc::new(move |tuple| {
+                    Ok((|t: ExpressionTerm| {
+                        Some(ExpressionTerm::GDayLiteral(match t {
+                            ExpressionTerm::GDayLiteral(value) => value,
+                            ExpressionTerm::GMonthDayLiteral(value) => value.into(),
+                            ExpressionTerm::DateLiteral(value) => value.into(),
+                            ExpressionTerm::DateTimeLiteral(value) => value.into(),
+                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            _ => return None,
+                        }))
+                    })(try_or_ok!(e(tuple)?)))
+                }));
+            }
+            return Err(ExpressionEvaluationError::UnsupportedFunction(
+                function.clone(),
+            ));
+        }
     })
 }
 
@@ -1588,22 +2104,30 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
 pub fn try_build_internal_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
     expression: &Expression,
     context: &mut C,
-) -> Result<Option<ExpressionEvaluator<'a, C::Tuple, C::Term>>, ExpressionEvaluationError<C::Error>>
+) -> Result<
+    Option<ExpressionEvaluator<'a, C::Tuple, C::Term, C::Error>>,
+    ExpressionEvaluationError<C::Error>,
+>
+where
+    C::Error: 'a,
 {
     Ok(Some(match expression {
         Expression::NamedNode(t) => {
             let t = context
                 .internalize_named_node(t)
                 .map_err(ExpressionEvaluationError::Context)?;
-            Rc::new(move |_| Some(t.clone()))
+            Rc::new(move |_| Ok(Some(t.clone())))
         }
         Expression::Literal(t) => {
             let t = context
                 .internalize_literal(t)
                 .map_err(ExpressionEvaluationError::Context)?;
-            Rc::new(move |_| Some(t.clone()))
+            Rc::new(move |_| Ok(Some(t.clone())))
         }
-        Expression::Variable(v) => Rc::new(context.build_variable_lookup(v)),
+        Expression::Variable(v) => {
+            let lookup = context.build_variable_lookup(v);
+            Rc::new(move |tuple| Ok(lookup(tuple)))
+        }
         Expression::Coalesce(l) => {
             let Some(l) = l
                 .iter()
@@ -1614,11 +2138,11 @@ pub fn try_build_internal_expression_evaluator<'a, C: ExpressionEvaluatorContext
             };
             Rc::new(move |tuple| {
                 for e in &l {
-                    if let Some(result) = e(tuple) {
-                        return Some(result);
+                    if let Some(result) = e(tuple)? {
+                        return Ok(Some(result));
                     }
                 }
-                None
+                Ok(None)
             })
         }
         Expression::If(a, b, c) => {
@@ -1630,7 +2154,7 @@ pub fn try_build_internal_expression_evaluator<'a, C: ExpressionEvaluatorContext
                 return Ok(None);
             };
             Rc::new(move |tuple| {
-                if a(tuple)?.effective_boolean_value()? {
+                if try_or_ok!(try_or_ok!(a(tuple)?).effective_boolean_value()) {
                     b(tuple)
                 } else {
                     c(tuple)
@@ -1642,17 +2166,26 @@ pub fn try_build_internal_expression_evaluator<'a, C: ExpressionEvaluatorContext
 }
 
 fn build_hash_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>, H: Digest>(
+    function_name: &NamedNode,
     parameters: &[Expression],
     context: &mut C,
-) -> Result<ExpressionEvaluator<'a, C::Tuple, ExpressionTerm>, ExpressionEvaluationError<C::Error>>
+) -> Result<
+    ExpressionEvaluator<'a, C::Tuple, ExpressionTerm, C::Error>,
+    ExpressionEvaluationError<C::Error>,
+>
+where
+    C::Error: 'a,
 {
-    let arg = build_expression_evaluator(&parameters[0], context)?;
+    let [arg] = extract_parameters(function_name, parameters)?;
+    let arg = build_expression_evaluator(arg, context)?;
     Ok(Rc::new(move |tuple| {
-        let ExpressionTerm::StringLiteral(input) = arg(tuple)? else {
-            return None;
+        let ExpressionTerm::StringLiteral(input) = try_or_ok!(arg(tuple)?) else {
+            return Ok(None);
         };
         let hash = hex::encode(H::new().chain_update(input.as_str()).finalize());
-        Some(ExpressionTerm::StringLiteral(OxString::new_owned(&hash)))
+        Ok(Some(ExpressionTerm::StringLiteral(OxString::new_owned(
+            &hash,
+        ))))
     }))
 }
 
@@ -2327,6 +2860,19 @@ fn write_hexa_bytes(bytes: &[u8], buffer: &mut String) {
             b'a' + (low - 10)
         }));
     }
+}
+
+fn extract_parameters<'a, E, const N: usize>(
+    function_name: &NamedNode,
+    parameters: &'a [Expression],
+) -> Result<&'a [Expression; N], ExpressionEvaluationError<E>> {
+    parameters
+        .try_into()
+        .map_err(|_| ExpressionEvaluationError::UnsupportedFunctionArity {
+            name: function_name.clone(),
+            expected: N..=N,
+            actual: parameters.len(),
+        })
 }
 
 #[cfg(test)]

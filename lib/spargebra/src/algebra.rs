@@ -1,63 +1,65 @@
 //! [SPARQL 1.1 Query Algebra](https://www.w3.org/TR/sparql11-query/#sparqlQuery) representation.
 
 use crate::term::*;
+use crate::vocab::sparql;
 use oxrdf::OxString;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 
 /// A [property path expression](https://www.w3.org/TR/sparql11-query/#defn_PropertyPathExpr).
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub enum PropertyPathExpression {
-    NamedNode(NamedNode),
-    Reverse(Box<Self>),
-    Sequence(Box<Self>, Box<Self>),
-    Alternative(Box<Self>, Box<Self>),
-    ZeroOrMore(Box<Self>),
-    OneOrMore(Box<Self>),
-    ZeroOrOne(Box<Self>),
-    NegatedPropertySet(Vec<NamedNode>),
+    Link(NamedNode),
+    Inv(Box<Self>),
+    Seq(Box<Self>, Box<Self>),
+    Alt(Box<Self>, Box<Self>),
+    ZeroOrMorePath(Box<Self>),
+    OneOrMorePath(Box<Self>),
+    ZeroOrOnePath(Box<Self>),
+    Nps(Vec<NamedNode>),
 }
 
 impl PropertyPathExpression {
     /// Formats using the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html).
     pub(crate) fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
         match self {
-            Self::NamedNode(p) => write!(f, "{p}"),
-            Self::Reverse(p) => {
+            Self::Link(p) => write!(f, "{p}"),
+            Self::Inv(p) => {
                 f.write_str("(reverse ")?;
                 p.fmt_sse(f)?;
                 f.write_str(")")
             }
-            Self::Alternative(a, b) => {
+            Self::Alt(a, b) => {
                 f.write_str("(alt ")?;
                 a.fmt_sse(f)?;
                 f.write_str(" ")?;
                 b.fmt_sse(f)?;
                 f.write_str(")")
             }
-            Self::Sequence(a, b) => {
+            Self::Seq(a, b) => {
                 f.write_str("(seq ")?;
                 a.fmt_sse(f)?;
                 f.write_str(" ")?;
                 b.fmt_sse(f)?;
                 f.write_str(")")
             }
-            Self::ZeroOrMore(p) => {
+            Self::ZeroOrMorePath(p) => {
                 f.write_str("(path* ")?;
                 p.fmt_sse(f)?;
                 f.write_str(")")
             }
-            Self::OneOrMore(p) => {
+            Self::OneOrMorePath(p) => {
                 f.write_str("(path+ ")?;
                 p.fmt_sse(f)?;
                 f.write_str(")")
             }
-            Self::ZeroOrOne(p) => {
+            Self::ZeroOrOnePath(p) => {
                 f.write_str("(path? ")?;
                 p.fmt_sse(f)?;
                 f.write_str(")")
             }
-            Self::NegatedPropertySet(p) => {
+            Self::Nps(p) => {
                 f.write_str("(notoneof")?;
                 for p in p {
                     write!(f, " {p}")?;
@@ -71,14 +73,14 @@ impl PropertyPathExpression {
 impl fmt::Display for PropertyPathExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NamedNode(p) => p.fmt(f),
-            Self::Reverse(p) => write!(f, "^({p})"),
-            Self::Sequence(a, b) => write!(f, "({a} / {b})"),
-            Self::Alternative(a, b) => write!(f, "({a} | {b})"),
-            Self::ZeroOrMore(p) => write!(f, "({p})*"),
-            Self::OneOrMore(p) => write!(f, "({p})+"),
-            Self::ZeroOrOne(p) => write!(f, "({p})?"),
-            Self::NegatedPropertySet(p) => {
+            Self::Link(p) => p.fmt(f),
+            Self::Inv(p) => write!(f, "^({p})"),
+            Self::Seq(a, b) => write!(f, "({a} / {b})"),
+            Self::Alt(a, b) => write!(f, "({a} | {b})"),
+            Self::ZeroOrMorePath(p) => write!(f, "({p})*"),
+            Self::OneOrMorePath(p) => write!(f, "({p})+"),
+            Self::ZeroOrOnePath(p) => write!(f, "({p})?"),
+            Self::Nps(p) => {
                 f.write_str("!(")?;
                 for (i, c) in p.iter().enumerate() {
                     if i > 0 {
@@ -94,7 +96,7 @@ impl fmt::Display for PropertyPathExpression {
 
 impl From<NamedNode> for PropertyPathExpression {
     fn from(p: NamedNode) -> Self {
-        Self::NamedNode(p)
+        Self::Link(p)
     }
 }
 
@@ -108,34 +110,10 @@ pub enum Expression {
     Or(Box<Self>, Box<Self>),
     /// [Logical-and](https://www.w3.org/TR/sparql11-query/#func-logical-and).
     And(Box<Self>, Box<Self>),
-    /// [RDFterm-equal](https://www.w3.org/TR/sparql11-query/#func-RDFterm-equal) and all the XSD equalities.
-    Equal(Box<Self>, Box<Self>),
-    /// [sameTerm](https://www.w3.org/TR/sparql11-query/#func-sameTerm).
-    SameTerm(Box<Self>, Box<Self>),
-    /// [op:numeric-greater-than](https://www.w3.org/TR/xpath-functions-31/#func-numeric-greater-than) and other XSD greater than operators.
-    Greater(Box<Self>, Box<Self>),
-    GreaterOrEqual(Box<Self>, Box<Self>),
-    /// [op:numeric-less-than](https://www.w3.org/TR/xpath-functions-31/#func-numeric-less-than) and other XSD greater than operators.
-    Less(Box<Self>, Box<Self>),
-    LessOrEqual(Box<Self>, Box<Self>),
     /// [IN](https://www.w3.org/TR/sparql11-query/#func-in)
     In(Box<Self>, Vec<Self>),
-    /// [op:numeric-add](https://www.w3.org/TR/xpath-functions-31/#func-numeric-add) and other XSD additions.
-    Add(Box<Self>, Box<Self>),
-    /// [op:numeric-subtract](https://www.w3.org/TR/xpath-functions-31/#func-numeric-subtract) and other XSD subtractions.
-    Subtract(Box<Self>, Box<Self>),
-    /// [op:numeric-multiply](https://www.w3.org/TR/xpath-functions-31/#func-numeric-multiply) and other XSD multiplications.
-    Multiply(Box<Self>, Box<Self>),
-    /// [op:numeric-divide](https://www.w3.org/TR/xpath-functions-31/#func-numeric-divide) and other XSD divides.
-    Divide(Box<Self>, Box<Self>),
-    /// [op:numeric-unary-plus](https://www.w3.org/TR/xpath-functions-31/#func-numeric-unary-plus) and other XSD unary plus.
-    UnaryPlus(Box<Self>),
-    /// [op:numeric-unary-minus](https://www.w3.org/TR/xpath-functions-31/#func-numeric-unary-minus) and other XSD unary minus.
-    UnaryMinus(Box<Self>),
-    /// [fn:not](https://www.w3.org/TR/xpath-functions-31/#func-not).
-    Not(Box<Self>),
     /// [EXISTS](https://www.w3.org/TR/sparql11-query/#func-filter-exists).
-    Exists(Box<GraphPattern>),
+    Exists(Box<QueryExpression>),
     /// [BOUND](https://www.w3.org/TR/sparql11-query/#func-bound).
     Bound(Variable),
     /// [IF](https://www.w3.org/TR/sparql11-query/#func-if).
@@ -143,7 +121,7 @@ pub enum Expression {
     /// [COALESCE](https://www.w3.org/TR/sparql11-query/#func-coalesce).
     Coalesce(Vec<Self>),
     /// A regular function call.
-    FunctionCall(Function, Vec<Self>),
+    FunctionCall(NamedNode, Vec<Self>),
 }
 
 impl Expression {
@@ -155,12 +133,6 @@ impl Expression {
             Self::Variable(var) => write!(f, "{var}"),
             Self::Or(a, b) => fmt_sse_binary_expression(f, "||", a, b),
             Self::And(a, b) => fmt_sse_binary_expression(f, "&&", a, b),
-            Self::Equal(a, b) => fmt_sse_binary_expression(f, "=", a, b),
-            Self::SameTerm(a, b) => fmt_sse_binary_expression(f, "sameTerm", a, b),
-            Self::Greater(a, b) => fmt_sse_binary_expression(f, ">", a, b),
-            Self::GreaterOrEqual(a, b) => fmt_sse_binary_expression(f, ">=", a, b),
-            Self::Less(a, b) => fmt_sse_binary_expression(f, "<", a, b),
-            Self::LessOrEqual(a, b) => fmt_sse_binary_expression(f, "<=", a, b),
             Self::In(a, b) => {
                 f.write_str("(in ")?;
                 a.fmt_sse(f)?;
@@ -170,16 +142,9 @@ impl Expression {
                 }
                 f.write_str(")")
             }
-            Self::Add(a, b) => fmt_sse_binary_expression(f, "+", a, b),
-            Self::Subtract(a, b) => fmt_sse_binary_expression(f, "-", a, b),
-            Self::Multiply(a, b) => fmt_sse_binary_expression(f, "*", a, b),
-            Self::Divide(a, b) => fmt_sse_binary_expression(f, "/", a, b),
-            Self::UnaryPlus(e) => fmt_sse_unary_expression(f, "+", e),
-            Self::UnaryMinus(e) => fmt_sse_unary_expression(f, "-", e),
-            Self::Not(e) => fmt_sse_unary_expression(f, "!", e),
             Self::FunctionCall(function, parameters) => {
-                f.write_str("( ")?;
-                function.fmt_sse(f)?;
+                f.write_str("(")?;
+                write!(f, "{function}")?;
                 for p in parameters {
                     f.write_str(" ")?;
                     p.fmt_sse(f)?;
@@ -222,19 +187,7 @@ impl Expression {
             | Self::NamedNode(_)
             | Self::Literal(_)
             | Self::Exists(_) => (),
-            Self::UnaryPlus(i) | Self::UnaryMinus(i) | Self::Not(i) => i.walk(callback),
-            Self::Or(l, r)
-            | Self::And(l, r)
-            | Self::Equal(l, r)
-            | Self::SameTerm(l, r)
-            | Self::Greater(l, r)
-            | Self::GreaterOrEqual(l, r)
-            | Self::Less(l, r)
-            | Self::LessOrEqual(l, r)
-            | Self::Add(l, r)
-            | Self::Subtract(l, r)
-            | Self::Multiply(l, r)
-            | Self::Divide(l, r) => {
+            Self::Or(l, r) | Self::And(l, r) => {
                 l.walk(callback);
                 r.walk(callback);
             }
@@ -276,45 +229,90 @@ impl fmt::Display for Expression {
             Self::Variable(var) => var.fmt(f),
             Self::Or(a, b) => write!(f, "({a} || {b})"),
             Self::And(a, b) => write!(f, "({a} && {b})"),
-            Self::Equal(a, b) => {
-                write!(f, "({a} = {b})")
-            }
-            Self::SameTerm(a, b) => {
-                write!(f, "sameTerm({a}, {b})")
-            }
-            Self::Greater(a, b) => {
-                write!(f, "({a} > {b})")
-            }
-            Self::GreaterOrEqual(a, b) => write!(f, "({a} >= {b})"),
-            Self::Less(a, b) => {
-                write!(f, "({a} < {b})")
-            }
-            Self::LessOrEqual(a, b) => write!(f, "({a} <= {b})"),
             Self::In(a, b) => {
                 write!(f, "({a} IN ")?;
                 write_arg_list(b, f)?;
                 f.write_str(")")
             }
-            Self::Add(a, b) => {
-                write!(f, "({a} + {b})")
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::EQUALS && parameters.len() == 2 =>
+            {
+                write!(f, "({} = {})", parameters[0], parameters[1])
             }
-            Self::Subtract(a, b) => {
-                write!(f, "({a} - {b})")
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::NOT_EQUALS && parameters.len() == 2 =>
+            {
+                write!(f, "({} != {})", parameters[0], parameters[1])
             }
-            Self::Multiply(a, b) => {
-                write!(f, "({a} * {b})")
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::GREATER_THAN && parameters.len() == 2 =>
+            {
+                write!(f, "({} > {})", parameters[0], parameters[1])
             }
-            Self::Divide(a, b) => {
-                write!(f, "({a} / {b})")
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::GREATER_THAN_OR_EQUAL && parameters.len() == 2 =>
+            {
+                write!(f, "({} >= {})", parameters[0], parameters[1])
             }
-            Self::UnaryPlus(e) => write!(f, "+({e})"),
-            Self::UnaryMinus(e) => write!(f, "-({e})"),
-            Self::Not(e) => match &**e {
-                Self::Exists(p) => write!(f, "NOT EXISTS {{ {p} }}"),
-                _ => write!(f, "!({e})"),
-            },
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::LESS_THAN && parameters.len() == 2 =>
+            {
+                write!(f, "({} < {})", parameters[0], parameters[1])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::LESS_THAN_OR_EQUAL && parameters.len() == 2 =>
+            {
+                write!(f, "({} <= {})", parameters[0], parameters[1])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::ADD && parameters.len() == 2 =>
+            {
+                write!(f, "({} + {})", parameters[0], parameters[1])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::SUBTRACT && parameters.len() == 2 =>
+            {
+                write!(f, "({} - {})", parameters[0], parameters[1])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::MULTIPLY && parameters.len() == 2 =>
+            {
+                write!(f, "({} * {})", parameters[0], parameters[1])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::DIVIDE && parameters.len() == 2 =>
+            {
+                write!(f, "({} / {})", parameters[0], parameters[1])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::UNARY_PLUS && parameters.len() == 1 =>
+            {
+                write!(f, "+({})", parameters[0])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::UNARY_MINUS && parameters.len() == 1 =>
+            {
+                write!(f, "-({})", parameters[0])
+            }
+            Self::FunctionCall(function, parameters)
+                if *function == sparql::LOGICAL_NOT && parameters.len() == 1 =>
+            {
+                match &parameters[0] {
+                    Expression::Exists(p) => write!(f, "NOT EXISTS {{ {p} }}"),
+                    Expression::In(a, b) => {
+                        write!(f, "({a} NOT IN ")?;
+                        write_arg_list(b, f)?;
+                        f.write_str(")")
+                    }
+                    p => write!(f, "!({p})"),
+                }
+            }
             Self::FunctionCall(function, parameters) => {
-                write!(f, "{function}")?;
+                if let Some(name) = function_name(function) {
+                    f.write_str(name)?;
+                } else {
+                    write!(f, "{function}")?;
+                }
                 write_arg_list(parameters, f)
             }
             Self::Bound(v) => write!(f, "BOUND({v})"),
@@ -371,230 +369,84 @@ fn write_arg_list(
     f.write_str(")")
 }
 
-/// A function name.
-#[derive(Eq, PartialEq, Debug, Clone, Hash)]
-pub enum Function {
-    Str,
-    Lang,
-    LangMatches,
-    Datatype,
-    Iri,
-    BNode,
-    Rand,
-    Abs,
-    Ceil,
-    Floor,
-    Round,
-    Concat,
-    SubStr,
-    StrLen,
-    Replace,
-    UCase,
-    LCase,
-    EncodeForUri,
-    Contains,
-    StrStarts,
-    StrEnds,
-    StrBefore,
-    StrAfter,
-    Year,
-    Month,
-    Day,
-    Hours,
-    Minutes,
-    Seconds,
-    Timezone,
-    Tz,
-    Now,
-    Uuid,
-    StrUuid,
-    Md5,
-    Sha1,
-    Sha256,
-    Sha384,
-    Sha512,
-    StrLang,
-    StrDt,
-    IsIri,
-    IsBlank,
-    IsLiteral,
-    IsNumeric,
-    Regex,
-    #[cfg(feature = "sparql-12")]
-    Triple,
-    #[cfg(feature = "sparql-12")]
-    Subject,
-    #[cfg(feature = "sparql-12")]
-    Predicate,
-    #[cfg(feature = "sparql-12")]
-    Object,
-    #[cfg(feature = "sparql-12")]
-    IsTriple,
-    #[cfg(feature = "sparql-12")]
-    LangDir,
-    #[cfg(feature = "sparql-12")]
-    HasLang,
-    #[cfg(feature = "sparql-12")]
-    HasLangDir,
-    #[cfg(feature = "sparql-12")]
-    StrLangDir,
-    #[cfg(feature = "sep-0002")]
-    Adjust,
-    Custom(NamedNode),
-}
-
-impl Function {
-    /// Formats using the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html).
-    pub(crate) fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        match self {
-            Self::Str => f.write_str("str"),
-            Self::Lang => f.write_str("lang"),
-            Self::LangMatches => f.write_str("langmatches"),
-            Self::Datatype => f.write_str("datatype"),
-            Self::Iri => f.write_str("iri"),
-            Self::BNode => f.write_str("bnode"),
-            Self::Rand => f.write_str("rand"),
-            Self::Abs => f.write_str("abs"),
-            Self::Ceil => f.write_str("ceil"),
-            Self::Floor => f.write_str("floor"),
-            Self::Round => f.write_str("round"),
-            Self::Concat => f.write_str("concat"),
-            Self::SubStr => f.write_str("substr"),
-            Self::StrLen => f.write_str("strlen"),
-            Self::Replace => f.write_str("replace"),
-            Self::UCase => f.write_str("ucase"),
-            Self::LCase => f.write_str("lcase"),
-            Self::EncodeForUri => f.write_str("encode_for_uri"),
-            Self::Contains => f.write_str("contains"),
-            Self::StrStarts => f.write_str("strstarts"),
-            Self::StrEnds => f.write_str("strends"),
-            Self::StrBefore => f.write_str("strbefore"),
-            Self::StrAfter => f.write_str("strafter"),
-            Self::Year => f.write_str("year"),
-            Self::Month => f.write_str("month"),
-            Self::Day => f.write_str("day"),
-            Self::Hours => f.write_str("hours"),
-            Self::Minutes => f.write_str("minutes"),
-            Self::Seconds => f.write_str("seconds"),
-            Self::Timezone => f.write_str("timezone"),
-            Self::Tz => f.write_str("tz"),
-            Self::Now => f.write_str("now"),
-            Self::Uuid => f.write_str("uuid"),
-            Self::StrUuid => f.write_str("struuid"),
-            Self::Md5 => f.write_str("md5"),
-            Self::Sha1 => f.write_str("sha1"),
-            Self::Sha256 => f.write_str("sha256"),
-            Self::Sha384 => f.write_str("sha384"),
-            Self::Sha512 => f.write_str("sha512"),
-            Self::StrLang => f.write_str("strlang"),
-            Self::StrDt => f.write_str("strdt"),
-            Self::IsIri => f.write_str("isiri"),
-            Self::IsBlank => f.write_str("isblank"),
-            Self::IsLiteral => f.write_str("isliteral"),
-            Self::IsNumeric => f.write_str("isnumeric"),
-            Self::Regex => f.write_str("regex"),
-            #[cfg(feature = "sparql-12")]
-            Self::Triple => f.write_str("triple"),
-            #[cfg(feature = "sparql-12")]
-            Self::Subject => f.write_str("subject"),
-            #[cfg(feature = "sparql-12")]
-            Self::Predicate => f.write_str("predicate"),
-            #[cfg(feature = "sparql-12")]
-            Self::Object => f.write_str("object"),
-            #[cfg(feature = "sparql-12")]
-            Self::IsTriple => f.write_str("istriple"),
-            #[cfg(feature = "sparql-12")]
-            Function::LangDir => f.write_str("langdir"),
-            #[cfg(feature = "sparql-12")]
-            Function::HasLang => f.write_str("haslang"),
-            #[cfg(feature = "sparql-12")]
-            Function::HasLangDir => f.write_str("haslangdir"),
-            #[cfg(feature = "sparql-12")]
-            Function::StrLangDir => f.write_str("strlangdir"),
-            #[cfg(feature = "sep-0002")]
-            Self::Adjust => f.write_str("adjust"),
-            Self::Custom(iri) => write!(f, "{iri}"),
-        }
-    }
-}
-
-impl fmt::Display for Function {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Str => f.write_str("STR"),
-            Self::Lang => f.write_str("LANG"),
-            Self::LangMatches => f.write_str("LANGMATCHES"),
-            Self::Datatype => f.write_str("DATATYPE"),
-            Self::Iri => f.write_str("IRI"),
-            Self::BNode => f.write_str("BNODE"),
-            Self::Rand => f.write_str("RAND"),
-            Self::Abs => f.write_str("ABS"),
-            Self::Ceil => f.write_str("CEIL"),
-            Self::Floor => f.write_str("FLOOR"),
-            Self::Round => f.write_str("ROUND"),
-            Self::Concat => f.write_str("CONCAT"),
-            Self::SubStr => f.write_str("SUBSTR"),
-            Self::StrLen => f.write_str("STRLEN"),
-            Self::Replace => f.write_str("REPLACE"),
-            Self::UCase => f.write_str("UCASE"),
-            Self::LCase => f.write_str("LCASE"),
-            Self::EncodeForUri => f.write_str("ENCODE_FOR_URI"),
-            Self::Contains => f.write_str("CONTAINS"),
-            Self::StrStarts => f.write_str("STRSTARTS"),
-            Self::StrEnds => f.write_str("STRENDS"),
-            Self::StrBefore => f.write_str("STRBEFORE"),
-            Self::StrAfter => f.write_str("STRAFTER"),
-            Self::Year => f.write_str("YEAR"),
-            Self::Month => f.write_str("MONTH"),
-            Self::Day => f.write_str("DAY"),
-            Self::Hours => f.write_str("HOURS"),
-            Self::Minutes => f.write_str("MINUTES"),
-            Self::Seconds => f.write_str("SECONDS"),
-            Self::Timezone => f.write_str("TIMEZONE"),
-            Self::Tz => f.write_str("TZ"),
-            Self::Now => f.write_str("NOW"),
-            Self::Uuid => f.write_str("UUID"),
-            Self::StrUuid => f.write_str("STRUUID"),
-            Self::Md5 => f.write_str("MD5"),
-            Self::Sha1 => f.write_str("SHA1"),
-            Self::Sha256 => f.write_str("SHA256"),
-            Self::Sha384 => f.write_str("SHA384"),
-            Self::Sha512 => f.write_str("SHA512"),
-            Self::StrLang => f.write_str("STRLANG"),
-            Self::StrDt => f.write_str("STRDT"),
-            Self::IsIri => f.write_str("isIRI"),
-            Self::IsBlank => f.write_str("isBLANK"),
-            Self::IsLiteral => f.write_str("isLITERAL"),
-            Self::IsNumeric => f.write_str("isNUMERIC"),
-            Self::Regex => f.write_str("REGEX"),
-            #[cfg(feature = "sparql-12")]
-            Self::Triple => f.write_str("TRIPLE"),
-            #[cfg(feature = "sparql-12")]
-            Self::Subject => f.write_str("SUBJECT"),
-            #[cfg(feature = "sparql-12")]
-            Self::Predicate => f.write_str("PREDICATE"),
-            #[cfg(feature = "sparql-12")]
-            Self::Object => f.write_str("OBJECT"),
-            #[cfg(feature = "sparql-12")]
-            Self::IsTriple => f.write_str("isTRIPLE"),
-            #[cfg(feature = "sparql-12")]
-            Function::LangDir => f.write_str("LANGDIR"),
-            #[cfg(feature = "sparql-12")]
-            Function::HasLang => f.write_str("hasLANG"),
-            #[cfg(feature = "sparql-12")]
-            Function::HasLangDir => f.write_str("hasLANGDIR"),
-            #[cfg(feature = "sparql-12")]
-            Function::StrLangDir => f.write_str("STRLANGDIR"),
-            #[cfg(feature = "sep-0002")]
-            Self::Adjust => f.write_str("ADJUST"),
-            Self::Custom(iri) => iri.fmt(f),
-        }
-    }
+fn function_name(function: &NamedNode) -> Option<&'static str> {
+    Some(match function.as_str() {
+        "http://www.w3.org/ns/sparql#abs" => "ABS",
+        #[cfg(feature = "sep-0002")]
+        "http://www.w3.org/ns/sparql#adjust" => "ADJUST",
+        "http://www.w3.org/ns/sparql#bnode" => "BNODE",
+        "http://www.w3.org/ns/sparql#ceil" => "CEIL",
+        "http://www.w3.org/ns/sparql#concat" => "CONCAT",
+        "http://www.w3.org/ns/sparql#contains" => "CONTAINS",
+        "http://www.w3.org/ns/sparql#datatype" => "DATATYPE",
+        "http://www.w3.org/ns/sparql#day" => "DAY",
+        "http://www.w3.org/ns/sparql#encode" => "ENCODE_FOR_URI",
+        "http://www.w3.org/ns/sparql#floor" => "FLOOR",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#hasLang" => "hasLANG",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#hasLangdir" => "hasLANGDIR",
+        "http://www.w3.org/ns/sparql#hours" => "HOURS",
+        "http://www.w3.org/ns/sparql#iri" => "IRI",
+        "http://www.w3.org/ns/sparql#isBlank" => "isBLANK",
+        "http://www.w3.org/ns/sparql#isIRI" => "isIRI",
+        "http://www.w3.org/ns/sparql#isLiteral" => "isLITERAL",
+        "http://www.w3.org/ns/sparql#isNumeric" => "isNUMERIC",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#isTriple" => "isTRIPLE",
+        "http://www.w3.org/ns/sparql#isURI" => "isURI",
+        "http://www.w3.org/ns/sparql#lang" => "LANG",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#langdir" => "LANGDIR",
+        "http://www.w3.org/ns/sparql#langMatches" => "LANGMATCHES",
+        "http://www.w3.org/ns/sparql#lcase" => "LCASE",
+        "http://www.w3.org/ns/sparql#md5" => "MD5",
+        "http://www.w3.org/ns/sparql#minutes" => "MINUTES",
+        "http://www.w3.org/ns/sparql#month" => "MONTH",
+        "http://www.w3.org/ns/sparql#now" => "NOW",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#object" => "OBJECT",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#predicate" => "PREDICATE",
+        "http://www.w3.org/ns/sparql#rand" => "RAND",
+        "http://www.w3.org/ns/sparql#regex" => "REGEX",
+        "http://www.w3.org/ns/sparql#replace" => "REPLACE",
+        "http://www.w3.org/ns/sparql#round" => "ROUND",
+        "http://www.w3.org/ns/sparql#sameTerm" => "sameTerm",
+        "http://www.w3.org/ns/sparql#seconds" => "SECONDS",
+        "http://www.w3.org/ns/sparql#sha1" => "SHA1",
+        "http://www.w3.org/ns/sparql#sha256" => "SHA256",
+        "http://www.w3.org/ns/sparql#sha384" => "SHA384",
+        "http://www.w3.org/ns/sparql#sha512" => "SHA512",
+        "http://www.w3.org/ns/sparql#str" => "STR",
+        "http://www.w3.org/ns/sparql#strafter" => "STRAFTER",
+        "http://www.w3.org/ns/sparql#strbefore" => "STRBEFORE",
+        "http://www.w3.org/ns/sparql#strdt" => "STRDT",
+        "http://www.w3.org/ns/sparql#strends" => "STRENDS",
+        "http://www.w3.org/ns/sparql#strlang" => "STRLANG",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#strlangdir" => "STRLANGDIR",
+        "http://www.w3.org/ns/sparql#strlen" => "STRLEN",
+        "http://www.w3.org/ns/sparql#strstarts" => "STRSTARTS",
+        "http://www.w3.org/ns/sparql#struuid" => "STRUUID",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#subject" => "SUBJECT",
+        "http://www.w3.org/ns/sparql#substr" => "SUBSTR",
+        "http://www.w3.org/ns/sparql#timezone" => "TIMEZONE",
+        #[cfg(feature = "sparql-12")]
+        "http://www.w3.org/ns/sparql#triple" => "TRIPLE",
+        "http://www.w3.org/ns/sparql#tz" => "TZ",
+        "http://www.w3.org/ns/sparql#ucase" => "UCASE",
+        "http://www.w3.org/ns/sparql#uri" => "URI",
+        "http://www.w3.org/ns/sparql#uuid" => "UUID",
+        "http://www.w3.org/ns/sparql#year" => "YEAR",
+        _ => return None,
+    })
 }
 
 /// A SPARQL query [graph pattern](https://www.w3.org/TR/sparql11-query/#sparqlQuery).
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
-pub enum GraphPattern {
+pub enum QueryExpression {
     /// A [basic graph pattern](https://www.w3.org/TR/sparql11-query/#defn_BasicGraphPattern).
     Bgp { patterns: Vec<TriplePattern> },
     /// A [property path pattern](https://www.w3.org/TR/sparql11-query/#defn_evalPP_predicate).
@@ -652,8 +504,8 @@ pub enum GraphPattern {
     /// [Slice](https://www.w3.org/TR/sparql11-query/#defn_algSlice).
     Slice {
         inner: Box<Self>,
-        start: u64,
-        length: Option<u64>,
+        offset: u64,
+        limit: Option<u64>,
     },
     /// [Group](https://www.w3.org/TR/sparql11-query/#aggregateAlgebra).
     Group {
@@ -669,7 +521,7 @@ pub enum GraphPattern {
     },
 }
 
-impl fmt::Display for GraphPattern {
+impl fmt::Display for QueryExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bgp { patterns } => {
@@ -825,12 +677,12 @@ impl fmt::Display for GraphPattern {
                 }
                 f.write_str(" }")
             }
-            p => write!(f, "{{ {} }}", SparqlGraphRootPattern::new(p, None)?),
+            p => write!(f, "{{ {} }}", SparqlRootQueryExpression::new(p, None)?),
         }
     }
 }
 
-impl Default for GraphPattern {
+impl Default for QueryExpression {
     fn default() -> Self {
         Self::Bgp {
             patterns: Vec::new(),
@@ -838,7 +690,7 @@ impl Default for GraphPattern {
     }
 }
 
-impl GraphPattern {
+impl QueryExpression {
     /// Formats using the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html).
     pub(crate) fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
         match self {
@@ -1027,13 +879,13 @@ impl GraphPattern {
             }
             Self::Slice {
                 inner,
-                start,
-                length,
+                offset,
+                limit,
             } => {
-                if let Some(length) = length {
-                    write!(f, "(slice {start} {length} ")?;
+                if let Some(limit) = limit {
+                    write!(f, "(slice {offset} {limit} ")?;
                 } else {
-                    write!(f, "(slice {start} _ ")?;
+                    write!(f, "(slice {offset} _ ")?;
                 }
                 inner.fmt_sse(f)?;
                 f.write_str(")")
@@ -1248,61 +1100,61 @@ fn lookup_triple_pattern_variables<'a>(
     }
 }
 
-pub(crate) struct SparqlGraphRootPattern<'a> {
+pub(crate) struct SparqlRootQueryExpression<'a> {
     option: SelectionOption,
     project: Option<Vec<(&'a Variable, Option<ExpressionOrAggregate<'a>>)>>,
-    pattern: &'a GraphPattern,
-    dataset: Option<&'a QueryDataset>,
+    expression: &'a QueryExpression,
+    dataset: Option<&'a QueryDatasetSpecification>,
     group_by: &'a [Variable],
     order: &'a [OrderExpression],
-    start: u64,
-    length: Option<u64>,
+    offset: u64,
+    limit: Option<u64>,
 }
 
-impl<'a> SparqlGraphRootPattern<'a> {
+impl<'a> SparqlRootQueryExpression<'a> {
     pub fn new(
-        mut pattern: &'a GraphPattern,
-        dataset: Option<&'a QueryDataset>,
+        mut expression: &'a QueryExpression,
+        dataset: Option<&'a QueryDatasetSpecification>,
     ) -> Result<Self, fmt::Error> {
         let mut option = SelectionOption::Default;
-        let mut start = 0;
-        let mut length = None;
+        let mut offset = 0;
+        let mut limit = None;
         let mut group_by = [].as_slice();
 
         // Before project
         loop {
-            match pattern {
-                GraphPattern::Distinct { inner } if option == SelectionOption::Default => {
+            match expression {
+                QueryExpression::Distinct { inner } if option == SelectionOption::Default => {
                     option = SelectionOption::Distinct;
-                    pattern = inner;
+                    expression = inner;
                 }
-                GraphPattern::Reduced { inner } if option == SelectionOption::Default => {
+                QueryExpression::Reduced { inner } if option == SelectionOption::Default => {
                     option = SelectionOption::Reduced;
-                    pattern = inner;
+                    expression = inner;
                 }
-                GraphPattern::Slice {
+                QueryExpression::Slice {
                     inner,
-                    start: s,
-                    length: l,
-                } if start == 0 && length.is_none() => {
-                    start = *s;
-                    length = *l;
-                    pattern = inner;
+                    offset: o,
+                    limit: l,
+                } if offset == 0 && limit.is_none() => {
+                    offset = *o;
+                    limit = *l;
+                    expression = inner;
                 }
                 _ => break,
             }
         }
-        let (project, order) = if let GraphPattern::Project { inner, variables } = pattern {
+        let (project, order) = if let QueryExpression::Project { inner, variables } = expression {
             // We have the projection
             let mut project = variables.iter().map(|v| (v, None)).collect::<Vec<_>>();
-            pattern = inner;
+            expression = inner;
 
             // we collect extends
-            while let GraphPattern::Extend {
+            while let QueryExpression::Extend {
                 inner,
-                expression,
+                expression: extend_expression,
                 variable,
-            } = pattern
+            } = expression
             {
                 if !project.iter().any(|(v, _)| *v == variable)
                     || project.iter().any(|(_, expr)| {
@@ -1327,24 +1179,28 @@ impl<'a> SparqlGraphRootPattern<'a> {
                     .iter_mut()
                     .find(|(v, _)| *v == variable)
                     .ok_or(fmt::Error)?
-                    .1 = Some(ExpressionOrAggregate::Expression(expression));
-                pattern = inner
+                    .1 = Some(ExpressionOrAggregate::Expression(extend_expression));
+                expression = inner
             }
 
             // Order by
-            let order = if let GraphPattern::OrderBy { inner, expression } = pattern {
-                pattern = inner;
-                expression
+            let order = if let QueryExpression::OrderBy {
+                inner,
+                expression: ordering_condition,
+            } = expression
+            {
+                expression = inner;
+                ordering_condition
             } else {
                 [].as_slice()
             };
 
             // And aggregates
-            if let GraphPattern::Group {
+            if let QueryExpression::Group {
                 inner,
                 variables,
                 aggregates,
-            } = pattern
+            } = expression
             {
                 // Currently, we only do this simplification if aggregates are directly projected
                 if aggregates.iter().all(|(agg_var, _)| {
@@ -1388,30 +1244,34 @@ impl<'a> SparqlGraphRootPattern<'a> {
                         }
                     }
                     group_by = variables.as_slice();
-                    pattern = inner;
+                    expression = inner;
                 }
             }
             (Some(project), order)
-        } else if let GraphPattern::OrderBy { inner, expression } = pattern {
-            pattern = inner;
-            (None, expression.as_slice())
+        } else if let QueryExpression::OrderBy {
+            inner,
+            expression: ordering_condition,
+        } = expression
+        {
+            expression = inner;
+            (None, ordering_condition.as_slice())
         } else {
             (None, [].as_slice())
         };
         Ok(Self {
             option,
             project,
-            pattern,
+            expression,
             dataset,
             group_by,
             order,
-            start,
-            length,
+            offset,
+            limit,
         })
     }
 }
 
-impl fmt::Display for SparqlGraphRootPattern<'_> {
+impl fmt::Display for SparqlRootQueryExpression<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SELECT")?;
         match self.option {
@@ -1423,7 +1283,8 @@ impl fmt::Display for SparqlGraphRootPattern<'_> {
             if project.is_empty() {
                 // We make sure there is no in-scope variable, if yes, it's not serializable
                 let mut with_in_scope = false;
-                self.pattern.on_in_scope_variable(|_| with_in_scope = true);
+                self.expression
+                    .on_in_scope_variable(|_| with_in_scope = true);
                 if with_in_scope {
                     return Err(fmt::Error);
                 }
@@ -1450,7 +1311,7 @@ impl fmt::Display for SparqlGraphRootPattern<'_> {
         if let Some(dataset) = self.dataset {
             write!(f, " {dataset}")?;
         }
-        write!(f, " WHERE {{ {} }}", self.pattern)?;
+        write!(f, " WHERE {{ {} }}", self.expression)?;
         if !self.group_by.is_empty() {
             f.write_str(" GROUP BY")?;
             for v in self.group_by {
@@ -1463,11 +1324,11 @@ impl fmt::Display for SparqlGraphRootPattern<'_> {
                 write!(f, " {c}")?;
             }
         }
-        if self.start > 0 {
-            write!(f, " OFFSET {}", self.start)?;
+        if self.offset > 0 {
+            write!(f, " OFFSET {}", self.offset)?;
         }
-        if let Some(length) = self.length {
-            write!(f, " LIMIT {length}")?;
+        if let Some(limit) = self.limit {
+            write!(f, " LIMIT {limit}")?;
         }
         Ok(())
     }
@@ -1485,15 +1346,17 @@ enum ExpressionOrAggregate<'a> {
     Aggregate(&'a AggregateExpression),
 }
 
-/// A set function used in aggregates (c.f. [`GraphPattern::Group`]).
+/// A set function used in aggregates (c.f. [`QueryExpression::Group`]).
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub enum AggregateExpression {
     /// [Count](https://www.w3.org/TR/sparql11-query/#defn_aggCount) with *.
     CountSolutions { distinct: bool },
     FunctionCall {
-        name: AggregateFunction,
+        name: NamedNode,
         expr: Expression,
         distinct: bool,
+        /// Optional parameters to the aggregate. Currently only "separator" for GROUP_CONCAT is used.
+        scalarvals: BTreeMap<OxString, OxString>,
     },
 }
 
@@ -1509,32 +1372,20 @@ impl AggregateExpression {
                 f.write_str(")")
             }
             Self::FunctionCall {
-                name:
-                    AggregateFunction::GroupConcat {
-                        separator: Some(separator),
-                    },
-                expr,
-                distinct,
-            } => {
-                f.write_str("(group_concat ")?;
-                if *distinct {
-                    f.write_str("distinct ")?;
-                }
-                expr.fmt_sse(f)?;
-                write!(f, " {})", Literal::new_simple_literal(separator.clone()))
-            }
-            Self::FunctionCall {
                 name,
                 expr,
                 distinct,
+                scalarvals,
             } => {
                 f.write_str("(")?;
-                name.fmt_sse(f)?;
-                f.write_str(" ")?;
+                write!(f, "{name} ")?;
                 if *distinct {
                     f.write_str("distinct ")?;
                 }
                 expr.fmt_sse(f)?;
+                for v in scalarvals.values() {
+                    write!(f, " {}", Literal::new_simple_literal(v.clone()))?;
+                }
                 f.write_str(")")
             }
         }
@@ -1558,98 +1409,48 @@ impl fmt::Display for AggregateExpression {
                 }
             }
             Self::FunctionCall {
-                name:
-                    AggregateFunction::GroupConcat {
-                        separator: Some(separator),
-                    },
-                expr,
-                distinct,
-            } => {
-                if *distinct {
-                    write!(
-                        f,
-                        "GROUP_CONCAT(DISTINCT {}; SEPARATOR = {})",
-                        expr,
-                        Literal::new_simple_literal(separator.clone())
-                    )
-                } else {
-                    write!(
-                        f,
-                        "GROUP_CONCAT({}; SEPARATOR = {})",
-                        expr,
-                        Literal::new_simple_literal(separator.clone())
-                    )
-                }
-            }
-            Self::FunctionCall {
                 name,
                 expr,
                 distinct,
+                scalarvals,
             } => {
-                if *distinct {
-                    write!(f, "{name}(DISTINCT {expr})")
+                if *name == sparql::AGG_COUNT {
+                    f.write_str("COUNT")
+                } else if *name == sparql::AGG_SUM {
+                    f.write_str("SUM")
+                } else if *name == sparql::AGG_AVG {
+                    f.write_str("AVG")
+                } else if *name == sparql::AGG_MIN {
+                    f.write_str("MIN")
+                } else if *name == sparql::AGG_MAX {
+                    f.write_str("MAX")
+                } else if *name == sparql::AGG_GROUP_CONCAT {
+                    f.write_str("GROUP_CONCAT")
+                } else if *name == sparql::AGG_SAMPLE {
+                    f.write_str("SAMPLE")
                 } else {
-                    write!(f, "{name}({expr})")
+                    name.fmt(f)
+                }?;
+                f.write_char('(')?;
+                if *distinct {
+                    f.write_str("DISTINCT ")?;
                 }
+                expr.fmt(f)?;
+                for (k, v) in scalarvals {
+                    write!(
+                        f,
+                        "; {} = {}",
+                        k.to_uppercase(),
+                        Literal::new_simple_literal(v.clone())
+                    )?;
+                }
+                f.write_char(')')
             }
         }
     }
 }
 
-/// An aggregate function name.
-#[derive(Eq, PartialEq, Debug, Clone, Hash)]
-pub enum AggregateFunction {
-    /// [Count](https://www.w3.org/TR/sparql11-query/#defn_aggCount) with *.
-    Count,
-    /// [Sum](https://www.w3.org/TR/sparql11-query/#defn_aggSum).
-    Sum,
-    /// [Avg](https://www.w3.org/TR/sparql11-query/#defn_aggAvg).
-    Avg,
-    /// [Min](https://www.w3.org/TR/sparql11-query/#defn_aggMin).
-    Min,
-    /// [Max](https://www.w3.org/TR/sparql11-query/#defn_aggMax).
-    Max,
-    /// [GroupConcat](https://www.w3.org/TR/sparql11-query/#defn_aggGroupConcat).
-    GroupConcat {
-        separator: Option<OxString>,
-    },
-    /// [Sample](https://www.w3.org/TR/sparql11-query/#defn_aggSample).
-    Sample,
-    Custom(NamedNode),
-}
-
-impl AggregateFunction {
-    /// Formats using the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html).
-    pub(crate) fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        match self {
-            Self::Count => f.write_str("count"),
-            Self::Sum => f.write_str("sum"),
-            Self::Avg => f.write_str("avg"),
-            Self::Min => f.write_str("min"),
-            Self::Max => f.write_str("max"),
-            Self::GroupConcat { .. } => f.write_str("group_concat"),
-            Self::Sample => f.write_str("sample"),
-            Self::Custom(iri) => write!(f, "{iri}"),
-        }
-    }
-}
-
-impl fmt::Display for AggregateFunction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Count => f.write_str("COUNT"),
-            Self::Sum => f.write_str("SUM"),
-            Self::Avg => f.write_str("AVG"),
-            Self::Min => f.write_str("MIN"),
-            Self::Max => f.write_str("MAX"),
-            Self::GroupConcat { .. } => f.write_str("GROUP_CONCAT"),
-            Self::Sample => f.write_str("SAMPLE"),
-            Self::Custom(iri) => iri.fmt(f),
-        }
-    }
-}
-
-/// An ordering comparator used by [`GraphPattern::OrderBy`].
+/// An ordering comparator used by [`QueryExpression::OrderBy`].
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub enum OrderExpression {
     /// Ascending order
@@ -1692,12 +1493,12 @@ impl fmt::Display for OrderExpression {
 
 /// A SPARQL query [dataset specification](https://www.w3.org/TR/sparql11-query/#specifyingDataset).
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
-pub struct QueryDataset {
+pub struct QueryDatasetSpecification {
     pub default: Vec<NamedNode>,
     pub named: Option<Vec<NamedNode>>,
 }
 
-impl QueryDataset {
+impl QueryDatasetSpecification {
     /// Formats using the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html).
     pub(crate) fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
         f.write_str("(")?;
@@ -1719,7 +1520,7 @@ impl QueryDataset {
     }
 }
 
-impl fmt::Display for QueryDataset {
+impl fmt::Display for QueryDatasetSpecification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for g in &self.default {
             write!(f, " FROM {g}")?;
@@ -1780,13 +1581,6 @@ impl From<GraphName> for GraphTarget {
             GraphName::DefaultGraph => Self::DefaultGraph,
         }
     }
-}
-
-#[inline]
-fn fmt_sse_unary_expression(f: &mut impl fmt::Write, name: &str, e: &Expression) -> fmt::Result {
-    write!(f, "({name} ")?;
-    e.fmt_sse(f)?;
-    f.write_str(")")
 }
 
 #[inline]

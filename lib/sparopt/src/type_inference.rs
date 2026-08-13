@@ -1,16 +1,17 @@
-use crate::algebra::{Expression, GraphPattern};
+use crate::algebra::{Expression, QueryExpression};
 use oxrdf::Variable;
-use spargebra::algebra::Function;
+use oxrdf::vocab::xsd;
 use spargebra::term::{GroundTerm, GroundTermPattern, NamedNodePattern};
+use spargebra::vocab::sparql;
 use std::collections::HashMap;
 use std::ops::{BitAnd, BitOr};
 
-pub fn infer_graph_pattern_types(
-    pattern: &GraphPattern,
+pub fn infer_query_expression_types(
+    query_expression: &QueryExpression,
     mut types: VariableTypes,
 ) -> VariableTypes {
-    match pattern {
-        GraphPattern::QuadPattern {
+    match query_expression {
+        QueryExpression::QuadPattern {
             subject,
             predicate,
             object,
@@ -26,84 +27,79 @@ pub fn infer_graph_pattern_types(
             }
             types
         }
-        GraphPattern::Path {
-            subject,
-            object,
-            graph_name,
-            ..
+        QueryExpression::Path {
+            subject, object, ..
         } => {
             add_ground_term_pattern_types(subject, &mut types, false);
             add_ground_term_pattern_types(object, &mut types, true);
-            if let Some(NamedNodePattern::Variable(v)) = graph_name {
-                types.intersect_variable_with(v.clone(), VariableType::NAMED_NODE)
-            }
             types
         }
-        GraphPattern::Graph { graph_name } => {
+        QueryExpression::Graph { graph_name, inner } => {
+            let mut types = infer_query_expression_types(inner, types);
             if let NamedNodePattern::Variable(v) = graph_name {
                 types.intersect_variable_with(v.clone(), VariableType::NAMED_NODE)
             }
             types
         }
-        GraphPattern::Join { left, right, .. } => {
-            let mut output_types = infer_graph_pattern_types(left, types.clone());
-            output_types.intersect_with(infer_graph_pattern_types(right, types));
+        QueryExpression::Join { left, right, .. } => {
+            let mut output_types = infer_query_expression_types(left, types.clone());
+            output_types.intersect_with(infer_query_expression_types(right, types));
             output_types
         }
         #[cfg(feature = "sep-0006")]
-        GraphPattern::Lateral { left, right } => {
-            infer_graph_pattern_types(right, infer_graph_pattern_types(left, types))
+        QueryExpression::Lateral { left, right } => {
+            infer_query_expression_types(right, infer_query_expression_types(left, types))
         }
-        GraphPattern::LeftJoin { left, right, .. } => {
-            let mut right_types = infer_graph_pattern_types(right, types.clone()); // TODO: expression
+        QueryExpression::LeftJoin { left, right, .. } => {
+            let mut right_types = infer_query_expression_types(right, types.clone()); // TODO: expression
             for t in right_types.inner.values_mut() {
                 t.undef = true; // Right might be unset
             }
-            let mut output_types = infer_graph_pattern_types(left, types);
+            let mut output_types = infer_query_expression_types(left, types);
             output_types.intersect_with(right_types);
             output_types
         }
-        GraphPattern::Minus { left, .. } => infer_graph_pattern_types(left, types),
-        GraphPattern::Union { inner } => inner
+        QueryExpression::Minus { left, .. } => infer_query_expression_types(left, types),
+        QueryExpression::Union { inner } => inner
             .iter()
-            .map(|inner| infer_graph_pattern_types(inner, types.clone()))
+            .map(|inner| infer_query_expression_types(inner, types.clone()))
             .reduce(|mut a, b| {
                 a.union_with(b);
                 a
             })
             .unwrap_or_default(),
-        GraphPattern::Extend {
+        QueryExpression::Extend {
             inner,
             variable,
             expression,
         } => {
-            let mut types = infer_graph_pattern_types(inner, types);
+            let mut types = infer_query_expression_types(inner, types);
             types.intersect_variable_with(
                 variable.clone(),
                 infer_expression_type(expression, &types),
             );
             types
         }
-        GraphPattern::Filter { inner, .. } => infer_graph_pattern_types(inner, types),
-        GraphPattern::Project { inner, variables } => VariableTypes {
-            inner: infer_graph_pattern_types(inner, types)
+        QueryExpression::Filter { inner, .. } => infer_query_expression_types(inner, types),
+        QueryExpression::Project { inner, variables } => VariableTypes {
+            inner: infer_query_expression_types(inner, types)
                 .inner
                 .into_iter()
                 .filter(|(v, _)| variables.contains(v))
                 .collect(),
         },
-        GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::OrderBy { inner, .. }
-        | GraphPattern::Slice { inner, .. } => infer_graph_pattern_types(inner, types),
-        GraphPattern::Group {
+        QueryExpression::Distinct { inner }
+        | QueryExpression::Reduced { inner }
+        | QueryExpression::OrderBy { inner, .. }
+        | QueryExpression::Slice { inner, .. } => infer_query_expression_types(inner, types),
+        QueryExpression::Group {
             inner,
             variables,
             aggregates,
         } => {
-            let types = infer_graph_pattern_types(inner, types);
+            let types = infer_query_expression_types(inner, types);
             VariableTypes {
-                inner: infer_graph_pattern_types(inner, types)
+                inner: infer_query_expression_types(inner, types)
                     .inner
                     .into_iter()
                     .filter(|(v, _)| variables.contains(v))
@@ -111,7 +107,7 @@ pub fn infer_graph_pattern_types(
                     .collect(),
             }
         }
-        GraphPattern::Values {
+        QueryExpression::Values {
             variables,
             bindings,
         } => {
@@ -130,13 +126,13 @@ pub fn infer_graph_pattern_types(
             }
             types
         }
-        GraphPattern::Service {
+        QueryExpression::Service {
             name,
             inner,
             silent,
         } => {
             let parent_types = types.clone();
-            let mut types = infer_graph_pattern_types(inner, types);
+            let mut types = infer_query_expression_types(inner, types);
             if *silent {
                 // On failure, single empty solution
                 types.union_with(parent_types);
@@ -180,100 +176,151 @@ pub fn infer_expression_type(expression: &Expression, types: &VariableTypes) -> 
             VariableType::LITERAL
         }
         Expression::Variable(v) => types.get(v),
-        Expression::FunctionCall(Function::Datatype | Function::Iri, _) => {
+        Expression::FunctionCall(name, _)
+            if [
+                sparql::DATATYPE,
+                sparql::IRI,
+                sparql::URI,
+                #[cfg(feature = "sparql-12")]
+                sparql::PREDICATE,
+            ]
+            .contains(name) =>
+        {
             VariableType::NAMED_NODE | VariableType::UNDEF
         }
-        #[cfg(feature = "sparql-12")]
-        Expression::FunctionCall(Function::Predicate, _) => {
-            VariableType::NAMED_NODE | VariableType::UNDEF
-        }
-        Expression::FunctionCall(Function::BNode, args) => {
+        Expression::FunctionCall(name, args) if *name == sparql::BNODE => {
             if args.is_empty() {
                 VariableType::BLANK_NODE
             } else {
                 VariableType::BLANK_NODE | VariableType::UNDEF
             }
         }
-        Expression::FunctionCall(
-            Function::Rand | Function::Now | Function::Uuid | Function::StrUuid,
-            _,
-        ) => VariableType::LITERAL,
-        Expression::Or(_)
-        | Expression::And(_)
-        | Expression::Equal(_, _)
-        | Expression::Greater(_, _)
-        | Expression::GreaterOrEqual(_, _)
-        | Expression::Less(_, _)
-        | Expression::LessOrEqual(_, _)
-        | Expression::Add(_, _)
-        | Expression::Subtract(_, _)
-        | Expression::Multiply(_, _)
-        | Expression::Divide(_, _)
-        | Expression::UnaryPlus(_)
-        | Expression::UnaryMinus(_)
-        | Expression::Not(_)
-        | Expression::FunctionCall(
-            Function::Str
-            | Function::Lang
-            | Function::LangMatches
-            | Function::Abs
-            | Function::Ceil
-            | Function::Floor
-            | Function::Round
-            | Function::Concat
-            | Function::SubStr
-            | Function::StrLen
-            | Function::Replace
-            | Function::UCase
-            | Function::LCase
-            | Function::EncodeForUri
-            | Function::Contains
-            | Function::StrStarts
-            | Function::StrEnds
-            | Function::StrBefore
-            | Function::StrAfter
-            | Function::Year
-            | Function::Month
-            | Function::Day
-            | Function::Hours
-            | Function::Minutes
-            | Function::Seconds
-            | Function::Timezone
-            | Function::Tz
-            | Function::Md5
-            | Function::Sha1
-            | Function::Sha256
-            | Function::Sha384
-            | Function::Sha512
-            | Function::StrLang
-            | Function::StrDt
-            | Function::IsIri
-            | Function::IsBlank
-            | Function::IsLiteral
-            | Function::IsNumeric
-            | Function::Regex,
-            _,
-        ) => VariableType::LITERAL | VariableType::UNDEF,
-        #[cfg(feature = "sparql-12")]
-        Expression::FunctionCall(
-            Function::LangDir | Function::StrLangDir | Function::HasLang | Function::HasLangDir,
-            _,
-        ) => VariableType::LITERAL | VariableType::UNDEF,
-        #[cfg(feature = "sep-0002")]
-        Expression::FunctionCall(Function::Adjust, _) => {
-            VariableType::LITERAL | VariableType::UNDEF
+        Expression::FunctionCall(name, _)
+            if [sparql::RAND, sparql::NOW, sparql::UUID, sparql::STRUUID].contains(name) =>
+        {
+            VariableType::LITERAL
         }
-        #[cfg(feature = "sparql-12")]
-        Expression::FunctionCall(Function::IsTriple, _) => {
-            VariableType::LITERAL | VariableType::UNDEF
-        }
-        Expression::SameTerm(left, right) => {
-            if infer_expression_type(left, types).undef || infer_expression_type(right, types).undef
+        Expression::Or(_) | Expression::And(_) => VariableType::LITERAL | VariableType::UNDEF,
+        Expression::FunctionCall(name, args) if *name == sparql::SAME_TERM => {
+            if args
+                .iter()
+                .any(|arg| infer_expression_type(arg, types).undef)
             {
                 VariableType::LITERAL | VariableType::UNDEF
             } else {
                 VariableType::LITERAL
             }
+        }
+        Expression::FunctionCall(name, _)
+            if [
+                sparql::LOGICAL_NOT,
+                sparql::STR,
+                sparql::EQUALS,
+                sparql::NOT_EQUALS,
+                sparql::GREATER_THAN,
+                sparql::GREATER_THAN_OR_EQUAL,
+                sparql::LESS_THAN,
+                sparql::LESS_THAN_OR_EQUAL,
+                sparql::ADD,
+                sparql::SUBTRACT,
+                sparql::MULTIPLY,
+                sparql::DIVIDE,
+                sparql::UNARY_PLUS,
+                sparql::UNARY_MINUS,
+                sparql::LANG,
+                sparql::LANG_MATCHES,
+                sparql::ABS,
+                sparql::CEIL,
+                sparql::FLOOR,
+                sparql::ROUND,
+                sparql::CONCAT,
+                sparql::SUBSTR,
+                sparql::STRLEN,
+                sparql::REPLACE,
+                sparql::UCASE,
+                sparql::LCASE,
+                sparql::ENCODE_FOR_URI,
+                sparql::CONTAINS,
+                sparql::STRSTARTS,
+                sparql::STRENDS,
+                sparql::STRBEFORE,
+                sparql::STRAFTER,
+                sparql::YEAR,
+                sparql::MONTH,
+                sparql::DAY,
+                sparql::HOURS,
+                sparql::MINUTES,
+                sparql::SECONDS,
+                sparql::TIMEZONE,
+                sparql::TZ,
+                sparql::MD5,
+                sparql::SHA1,
+                sparql::SHA256,
+                sparql::SHA384,
+                sparql::SHA512,
+                sparql::STRLANG,
+                sparql::STRDT,
+                sparql::IS_IRI,
+                sparql::IS_URI,
+                sparql::IS_BLANK,
+                sparql::IS_LITERAL,
+                sparql::IS_NUMERIC,
+                sparql::REGEX,
+                #[cfg(feature = "sparql-12")]
+                sparql::LANGDIR,
+                #[cfg(feature = "sparql-12")]
+                sparql::STRLANGDIR,
+                #[cfg(feature = "sparql-12")]
+                sparql::HAS_LANG,
+                #[cfg(feature = "sparql-12")]
+                sparql::HAS_LANGDIR,
+                #[cfg(feature = "sparql-12")]
+                sparql::IS_TRIPLE,
+                #[cfg(feature = "sep-0002")]
+                sparql::ADJUST,
+                xsd::ANY_URI,
+                xsd::BASE_64_BINARY,
+                xsd::BOOLEAN,
+                xsd::BYTE,
+                xsd::DATE,
+                xsd::DAY_TIME_DURATION,
+                xsd::DATE_TIME,
+                xsd::DATE_TIME_STAMP,
+                xsd::DECIMAL,
+                xsd::DOUBLE,
+                xsd::DURATION,
+                xsd::FLOAT,
+                xsd::G_DAY,
+                xsd::G_MONTH,
+                xsd::G_MONTH_DAY,
+                xsd::G_YEAR,
+                xsd::G_YEAR_MONTH,
+                xsd::HEX_BINARY,
+                xsd::INT,
+                xsd::INTEGER,
+                xsd::LANGUAGE,
+                xsd::LONG,
+                xsd::NAME,
+                xsd::NC_NAME,
+                xsd::NEGATIVE_INTEGER,
+                xsd::NMTOKEN,
+                xsd::NON_NEGATIVE_INTEGER,
+                xsd::NON_POSITIVE_INTEGER,
+                xsd::NORMALIZED_STRING,
+                xsd::POSITIVE_INTEGER,
+                xsd::TIME,
+                xsd::SHORT,
+                xsd::STRING,
+                xsd::TOKEN,
+                xsd::UNSIGNED_BYTE,
+                xsd::UNSIGNED_INT,
+                xsd::UNSIGNED_LONG,
+                xsd::UNSIGNED_SHORT,
+                xsd::YEAR_MONTH_DURATION,
+            ]
+            .contains(name) =>
+        {
+            VariableType::LITERAL | VariableType::UNDEF // TODO: add xsd: cast functions
         }
         Expression::If(condition, then, els) => {
             let mut t = infer_expression_type(then, types) | infer_expression_type(els, types);
@@ -295,14 +342,18 @@ pub fn infer_expression_type(expression: &Expression, types: &VariableTypes) -> 
             t
         }
         #[cfg(feature = "sparql-12")]
-        Expression::FunctionCall(Function::Triple, _) => VariableType::TRIPLE | VariableType::UNDEF,
+        Expression::FunctionCall(name, _) if *name == sparql::TRIPLE => {
+            VariableType::TRIPLE | VariableType::UNDEF
+        }
         #[cfg(feature = "sparql-12")]
-        Expression::FunctionCall(Function::Subject, _) => {
+        Expression::FunctionCall(name, _) if *name == sparql::SUBJECT => {
             VariableType::SUBJECT | VariableType::UNDEF
         }
         #[cfg(feature = "sparql-12")]
-        Expression::FunctionCall(Function::Object, _) => VariableType::TERM | VariableType::UNDEF,
-        Expression::FunctionCall(Function::Custom(_), _) => VariableType::ANY,
+        Expression::FunctionCall(name, _) if *name == sparql::OBJECT => {
+            VariableType::TERM | VariableType::UNDEF
+        }
+        Expression::FunctionCall(_, _) => VariableType::ANY,
     }
 }
 
