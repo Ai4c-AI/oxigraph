@@ -421,6 +421,7 @@ jobs:
         with:
           name: oxigraph_dotnet_linux_${{ matrix.arch }}
           path: runtimes/linux-${{ matrix.arch }}/native/liboxigraph_dotnet.so
+          retention-days: 1
 
   dotnet_native_macos:
     strategy:
@@ -450,6 +451,7 @@ jobs:
         with:
           name: oxigraph_dotnet_osx_${{ matrix.arch }}
           path: runtimes/osx-${{ matrix.arch }}/native/liboxigraph_dotnet.dylib
+          retention-days: 1
 
   dotnet_native_windows:
     strategy:
@@ -475,6 +477,7 @@ jobs:
         with:
           name: oxigraph_dotnet_win_${{ matrix.arch }}
           path: runtimes\win-${{ matrix.arch }}\native\oxigraph_dotnet.dll
+          retention-days: 1
 
   dotnet_pack:
     if: github.event_name == 'release' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dotnet' || github.event_name == 'workflow_dispatch'
@@ -498,6 +501,17 @@ jobs:
           pattern: oxigraph_dotnet_*
           path: dotnet/src/Oxigraph/runtimes
           merge-multiple: true
+          extract: true
+      - name: Flatten runtime artifacts
+        run: |
+          # Move contents from nested runtimes/*/native/* to runtimes/*/native/*
+          for arch_dir in runtimes/*/; do
+            if [ -d "$arch_dir/runtimes" ]; then
+              cp -r "$arch_dir/runtimes/"* "$arch_dir/" 2>/dev/null || true
+              rm -rf "$arch_dir/runtimes"
+            fi
+          done
+        working-directory: dotnet/src/Oxigraph
       - name: Extract version
         id: version
         run: echo "VERSION=$(grep -m1 '^version' dotnet/src/oxigraph-dotnet/Cargo.toml | sed 's/.*\"\(.*\)\"/\1/')" >> $GITHUB_OUTPUT
