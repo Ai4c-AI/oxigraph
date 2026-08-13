@@ -48,6 +48,13 @@ public enum CanonicalizationAlgorithm
     Rdfc10Sha256,
     /// <summary>RDFC-1.0 with SHA-384.</summary>
     Rdfc10Sha384,
+    /// <summary>Oxigraph preferred algorithm but outputting ids based on hashes.</summary>
+    /// <remarks>
+    /// This enables the use of blank node ids for diffing where additions or deletions
+    /// of triples affect fewer blank node ids. Warning: might change between Oxigraph
+    /// versions. No stability guarantees.
+    /// </remarks>
+    UnstableHashedIds,
 }
 
 /// <summary>Options for dumping/serializing RDF data.</summary>
