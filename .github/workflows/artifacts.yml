@@ -411,7 +411,7 @@ jobs:
           submodules: true
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
-      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+      - uses: actions/setup-dotnet@v5 # v5
         with:
           dotnet-version: '10.0.x'
       - run: cargo build --release -p oxigraph-dotnet --features oxigraph/rocksdb
@@ -440,7 +440,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           target: ${{ matrix.target }}
-      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+      - uses: actions/setup-dotnet@v5 # v5
         with:
           dotnet-version: '10.0.x'
       - run: cargo build --release -p oxigraph-dotnet --target ${{ matrix.target }} --features oxigraph/rocksdb
@@ -465,7 +465,7 @@ jobs:
           submodules: true
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
-      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+      - uses: actions/setup-dotnet@v5 # v5
         with:
           dotnet-version: '10.0.x'
       - run: cargo build --release -p oxigraph-dotnet
@@ -490,7 +490,7 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - uses: actions/setup-dotnet@67eea4964bcdcf3b6a0fbb9b6d1a0dfe09ace6b8 # v5
+      - uses: actions/setup-dotnet@v5 # v5
         with:
           dotnet-version: '10.0.x'
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
