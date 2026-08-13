@@ -1090,6 +1090,30 @@ public class ModelTests
         Assert.Empty(mapping);
     }
 
+    [Fact]
+    public async Task CanonicalizeBlankNodesAsync_ReturnsCorrectMapping()
+    {
+        using var ds = new Dataset();
+        ds.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+
+        var mapping = await ds.CanonicalizeBlankNodesAsync(CanonicalizationAlgorithm.Unstable);
+
+        Assert.Single(mapping);
+        Assert.Contains(new BlankNode("a"), mapping.Keys);
+    }
+
+    [Fact]
+    public async Task CanonicalizeBlankNodesAsync_CancellationToken_Cancels()
+    {
+        using var ds = new Dataset();
+        ds.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAsync<TaskCanceledException>(
+            () => ds.CanonicalizeBlankNodesAsync(CanonicalizationAlgorithm.Unstable, cts.Token));
+    }
+
     // ═══════════════════════════════════════════════════
     // QuerySolution — edge cases
     // ═══════════════════════════════════════════════════

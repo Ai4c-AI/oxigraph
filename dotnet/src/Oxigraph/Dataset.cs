@@ -288,4 +288,10 @@ public sealed class Dataset : IEnumerable<Quad>, IDisposable
         CanonicalizationAlgorithm algorithm = CanonicalizationAlgorithm.Unstable,
         CancellationToken ct = default)
         => Task.Run(() => Canonicalize(algorithm), ct);
+
+    /// <inheritdoc cref="CanonicalizeBlankNodes" />
+    public Task<IReadOnlyDictionary<BlankNode, BlankNode>> CanonicalizeBlankNodesAsync(
+        CanonicalizationAlgorithm algorithm = CanonicalizationAlgorithm.Unstable,
+        CancellationToken ct = default)
+        => Task.Run(() => CanonicalizeBlankNodes(algorithm), ct);
 }
