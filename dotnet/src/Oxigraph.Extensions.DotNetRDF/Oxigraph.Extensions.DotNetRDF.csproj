@@ -15,4 +15,8 @@
     <Description>dotNetRDF interoperability adapters for Oxigraph</Description>
   </PropertyGroup>
 
+  <ItemGroup>
+    <None Include="..\..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
 </Project>
