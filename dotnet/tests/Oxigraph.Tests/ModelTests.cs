@@ -1028,6 +1028,69 @@ public class ModelTests
     }
 
     // ═══════════════════════════════════════════════════
+    // CanonicalizeBlankNodes — mapping tests
+    // ═══════════════════════════════════════════════════
+
+    [Fact]
+    public void CanonicalizeBlankNodes_Unstable_ReturnsCorrectMapping()
+    {
+        using var ds = new Dataset();
+        ds.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+
+        var mapping = ds.CanonicalizeBlankNodes(CanonicalizationAlgorithm.Unstable);
+
+        Assert.Single(mapping);
+        Assert.Contains(new BlankNode("a"), mapping.Keys);
+        Assert.NotEqual(new BlankNode("a"), mapping[new BlankNode("a")]);
+    }
+
+    [Fact]
+    public void CanonicalizeBlankNodes_Rdfc10Sha256_ReturnsCorrectMapping()
+    {
+        using var ds = new Dataset();
+        ds.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+
+        var mapping = ds.CanonicalizeBlankNodes(CanonicalizationAlgorithm.Rdfc10Sha256);
+
+        Assert.Single(mapping);
+        Assert.Contains(new BlankNode("a"), mapping.Keys);
+    }
+
+    [Fact]
+    public void CanonicalizeBlankNodes_UnstableHashedIds_ReturnsStableIds()
+    {
+        using var ds = new Dataset();
+        ds.Add(new Quad(new BlankNode("a"), new NamedNode("http://example.com/p"), new Literal("b"), new DefaultGraph()));
+
+        var mapping1 = ds.CanonicalizeBlankNodes(CanonicalizationAlgorithm.UnstableHashedIds);
+        var mapping2 = ds.CanonicalizeBlankNodes(CanonicalizationAlgorithm.UnstableHashedIds);
+
+        Assert.Single(mapping1);
+        Assert.Equal(mapping1[new BlankNode("a")], mapping2[new BlankNode("a")]);
+    }
+
+    [Fact]
+    public void CanonicalizeBlankNodes_EmptyDataset_ReturnsEmptyDictionary()
+    {
+        using var ds = new Dataset();
+
+        var mapping = ds.CanonicalizeBlankNodes();
+
+        Assert.Empty(mapping);
+    }
+
+    [Fact]
+    public void CanonicalizeBlankNodes_NoBlankNodes_ReturnsEmptyDictionary()
+    {
+        using var ds = new Dataset();
+        ds.Add(new Quad(new NamedNode("http://example.com/s"), new NamedNode("http://example.com/p"), new Literal("o"), new DefaultGraph()));
+
+        var mapping = ds.CanonicalizeBlankNodes();
+
+        Assert.Empty(mapping);
+    }
+
+    // ═══════════════════════════════════════════════════
     // QuerySolution — edge cases
     // ═══════════════════════════════════════════════════
 

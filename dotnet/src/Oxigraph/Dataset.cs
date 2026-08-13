@@ -211,7 +211,11 @@ public sealed class Dataset : IEnumerable<Quad>, IDisposable
         var dict = new Dictionary<BlankNode, BlankNode>();
         foreach (var prop in ok.EnumerateObject())
         {
-            dict[new BlankNode(prop.Name)] = new BlankNode(prop.Value.GetString()!);
+            var keyId = prop.Name.StartsWith("_:") ? prop.Name[2..] : prop.Name;
+            var valueId = prop.Value.GetString()!.StartsWith("_:")
+                ? prop.Value.GetString()![2..]
+                : prop.Value.GetString()!;
+            dict[new BlankNode(keyId)] = new BlankNode(valueId);
         }
         return dict;
     }
