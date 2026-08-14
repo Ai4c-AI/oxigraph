@@ -496,11 +496,28 @@ jobs:
       - uses: actions/setup-dotnet@v5 # v5
         with:
           dotnet-version: '10.0.x'
+      # Download each platform's native library separately to avoid merge-multiple
+      # flattening the directory structure and causing overwrites
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: oxigraph_dotnet_*
-          path: dotnet/src/Oxigraph/runtimes
-          merge-multiple: true
+          name: oxigraph_dotnet_linux_x64
+          path: dotnet/src/Oxigraph/runtimes/linux-x64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: oxigraph_dotnet_linux_arm64
+          path: dotnet/src/Oxigraph/runtimes/linux-arm64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: oxigraph_dotnet_osx_x64
+          path: dotnet/src/Oxigraph/runtimes/osx-x64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: oxigraph_dotnet_osx_arm64
+          path: dotnet/src/Oxigraph/runtimes/osx-arm64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: oxigraph_dotnet_win_x64
+          path: dotnet/src/Oxigraph/runtimes/win-x64
       - name: Debug artifact structure
         run: |
           echo "=== Downloaded runtime structure ==="
@@ -508,55 +525,29 @@ jobs:
           echo "=== Directory structure ==="
           find runtimes -type d 2>/dev/null || echo "No dirs found"
         working-directory: dotnet/src/Oxigraph
-      - name: Flatten runtime artifacts
+      - name: Ensure native directory structure
         run: |
-          # Normalize any Windows-style backslash paths that came from Windows artifacts
-          # On Linux, backslashes in filenames are literal characters, not separators
-          find runtimes -type f | while IFS= read -r filepath; do
-            if echo "$filepath" | grep -q '\\'; then
-              echo "Found Windows-style path: $filepath"
-              normalized=$(echo "$filepath" | tr '\\' '/')
-              dir=$(dirname "$normalized")
-              mkdir -p "$dir"
-              mv "$filepath" "$dir/"
-              echo "  -> Moved to: $dir/"
-            fi
-          done
+          # Each platform artifact was downloaded to its own directory (runtimes/<os>-<arch>/).
+          # Ensure the structure is: runtimes/<os>-<arch>/native/<lib>
+          echo "=== Runtime structure before fix ==="
+          find runtimes -type f 2>/dev/null
 
-          # Handle nested runtimes/runtimes/<os>-<arch>/native/* structure
           for arch_dir in runtimes/*/; do
-            if [ -d "$arch_dir/runtimes" ]; then
-              echo "Found nested runtimes in $arch_dir, flattening..."
-              cp -r "$arch_dir/runtimes/"* "$arch_dir/" 2>/dev/null || true
-              rm -rf "$arch_dir/runtimes"
+            arch_name=$(basename "$arch_dir")
+            # Normalize any Windows-style backslash paths
+            if [ -d "$arch_dir/native" ]; then
+              echo "  $arch_name already has native/ subdir - OK"
+            else
+              # Check if files are flat in the arch_dir (merge-multiple leftover)
+              if ls "$arch_dir"/*.so "$arch_dir"/*.dylib "$arch_dir"/*.dll 2>/dev/null | grep -q .; then
+                echo "  $arch_name has flat files, moving to native/..."
+                mkdir -p "$arch_dir/native"
+                mv "$arch_dir"/* "$arch_dir/native/" 2>/dev/null || true
+              fi
             fi
           done
 
-          # Handle files inside runtimes/native/ (merge-multiple puts them here when artifact path
-          # was runtimes/<os>-<arch>/native/<file>). Also handles flat files in runtimes/ directly.
-          # Detect platform from extension: .so=linux, .dylib=osx, .dll=windows
-          find runtimes -type f | while IFS= read -r f; do
-            filename=$(basename "$f")
-            case "$filename" in
-              *.dll)
-                echo "Detected Windows DLL: $filename -> win-x64/native/"
-                mkdir -p runtimes/win-x64/native
-                mv "$f" runtimes/win-x64/native/
-                ;;
-              *.dylib)
-                echo "Detected macOS dylib: $filename -> osx-x64/native/"
-                mkdir -p runtimes/osx-x64/native
-                mv "$f" runtimes/osx-x64/native/
-                ;;
-              *.so)
-                echo "Detected Linux SO: $filename -> linux-x64/native/"
-                mkdir -p runtimes/linux-x64/native
-                mv "$f" runtimes/linux-x64/native/
-                ;;
-            esac
-          done
-
-          echo "=== Final structure ==="
+          echo "=== Runtime structure after fix ==="
           find runtimes -type f 2>/dev/null
         working-directory: dotnet/src/Oxigraph
       - name: Extract version
