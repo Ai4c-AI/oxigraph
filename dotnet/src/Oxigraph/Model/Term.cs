@@ -79,7 +79,7 @@ public class TermConverter : JsonConverter<ITerm>
                 if (lit.Datatype != null)
                 {
                     writer.WritePropertyName("datatype");
-                    JsonSerializer.Serialize(writer, lit.Datatype, options);
+                    writer.WriteStringValue(lit.Datatype.Value);
                 }
                 writer.WriteEndObject();
                 break;

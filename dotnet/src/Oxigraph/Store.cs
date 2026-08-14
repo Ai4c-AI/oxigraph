@@ -13,6 +13,17 @@ public sealed class Store : IDisposable, IEnumerable<Quad>
 {
     private readonly StoreSafeHandle _handle;
 
+    private static readonly JsonSerializerOptions QuadJsonOptions = new()
+    {
+        Converters =
+        {
+            new NamedOrBlankNodeConverter(),
+            new NamedNodeConverter(),
+            new TermConverter(),
+            new GraphNameConverter(),
+        }
+    };
+
     private Store(IntPtr handle)
     {
         _handle = new StoreSafeHandle(handle);
@@ -55,7 +66,7 @@ public sealed class Store : IDisposable, IEnumerable<Quad>
     /// <summary>Insert a quad into the store.</summary>
     public void Add(Quad quad)
     {
-        var json = JsonSerializer.Serialize(quad);
+        var json = JsonSerializer.Serialize(quad, QuadJsonOptions);
         FFIHelper.CallVoid(() =>
             OxigraphNative.store_add(_handle.DangerousGetHandle(), json));
     }
@@ -63,7 +74,7 @@ public sealed class Store : IDisposable, IEnumerable<Quad>
     /// <summary>Remove a quad from the store.</summary>
     public void Remove(Quad quad)
     {
-        var json = JsonSerializer.Serialize(quad);
+        var json = JsonSerializer.Serialize(quad, QuadJsonOptions);
         FFIHelper.CallVoid(() =>
             OxigraphNative.store_remove(_handle.DangerousGetHandle(), json));
     }
@@ -71,7 +82,7 @@ public sealed class Store : IDisposable, IEnumerable<Quad>
     /// <summary>Check if a quad exists in the store.</summary>
     public bool Contains(Quad quad)
     {
-        var json = JsonSerializer.Serialize(quad);
+        var json = JsonSerializer.Serialize(quad, QuadJsonOptions);
         var result = FFIHelper.CallValue<bool>(() =>
             OxigraphNative.store_contains(_handle.DangerousGetHandle(), json));
         return result;

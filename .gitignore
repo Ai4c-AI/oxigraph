@@ -31,3 +31,4 @@ data/
 *.so
 *.pyc
 **.pyi
+dotnet/src/Oxigraph/runtimes/win-x64/native/oxigraph_dotnet.dll

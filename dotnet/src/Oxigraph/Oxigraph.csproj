@@ -17,6 +17,16 @@
     <None Include="..\..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <!-- Include native DLLs in project reference output so consuming projects find them -->
+  <PropertyGroup>
+    <TargetsForCopyToOutputDirectory>IncludeNativeLibrariesForProjectReference</TargetsForCopyToOutputDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <NativeLibrariesForProjectReference Include="$(MSBuildThisFileDirectory)runtimes/win-x64/native/oxigraph_dotnet.dll"
+                                         Condition="Exists('$(MSBuildThisFileDirectory)runtimes/win-x64/native/oxigraph_dotnet.dll')" />
+  </ItemGroup>
+
   <ItemGroup>
     <Content Include="runtimes/win-x64/native/oxigraph_dotnet.dll"
              Condition="Exists('runtimes/win-x64/native/oxigraph_dotnet.dll')"

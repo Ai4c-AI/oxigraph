@@ -12,8 +12,8 @@ public static class Extensions
         IBlankNode b => new BlankNode(b.InternalID),
         ILiteralNode l => !string.IsNullOrEmpty(l.Language)
             ? new Literal(l.Value, l.Language)
-            : l.DataType != null
-                ? new Literal(l.Value, Datatype: new NamedNode(l.DataType.AbsoluteUri))
+            : l.DataType is { } dt && !string.IsNullOrEmpty(dt.AbsoluteUri) && dt.AbsoluteUri != Literal.XsdString.Value
+                ? new Literal(l.Value, Datatype: new NamedNode(dt.AbsoluteUri))
                 : new Literal(l.Value),
         _ => throw new ArgumentException($"Unknown node type: {node.GetType()}"),
     };
